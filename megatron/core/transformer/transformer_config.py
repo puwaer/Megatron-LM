@@ -924,6 +924,47 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    ####################
+    # mHC (Manifold-Constrained Hyper-Connections)
+    ####################
+    use_mhc: bool = False
+    """Whether to use Manifold-Constrained Hyper-Connections (mHC) instead of standard residual
+    connections. mHC extends residual connections to n parallel streams and constrains the mixing
+    matrix to be doubly stochastic via Sinkhorn-Knopp projection. See arXiv:2512.24880."""
+
+    mhc_num_streams: int = 4
+    """Number of parallel residual streams for mHC. The paper uses 4 streams."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for projecting the residual mixing matrix H_res onto
+    the doubly stochastic manifold (Birkhoff polytope). 20 iterations typically suffice."""
+
+    ####################
+    # Engram (Conditional Memory via Scalable Lookup)
+    ####################
+    use_engram: bool = False
+    """Whether to use Engram conditional memory modules. Engram provides a second axis of sparsity
+    via deterministic N-gram hash-based memory lookup. See arXiv:2601.07372."""
+
+    engram_layer_ids: Optional[List[int]] = None
+    """List of 0-indexed layer IDs where Engram modules are inserted (e.g. [0, 14] for layers 1
+    and 15). If None and use_engram=True, defaults to [0, num_layers // 2]."""
+
+    engram_max_ngram_size: int = 3
+    """Maximum N-gram size for Engram memory lookup (supports 2-gram up to this size)."""
+
+    engram_n_embed_per_ngram: int = 512
+    """Embedding dimension per N-gram in the Engram multi-head embedding table."""
+
+    engram_n_head_per_ngram: int = 8
+    """Number of hash heads per N-gram for collision resistance in Engram."""
+
+    engram_seed: int = 0
+    """Random seed for Engram hash multiplier generation (deterministic hashing)."""
+
+    engram_base_vocab_size: int = 129280
+    """Base vocabulary size used by the tokenizer (default: DeepSeek-V3 tokenizer size)."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more

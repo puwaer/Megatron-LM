@@ -1,0 +1,196 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""FujiBlock: TransformerBlock extended for mHC + Engram (Fuji architecture).
+
+FujiBlock extends TransformerBlock with three additions:
+
+1. **mHC stream expansion/collapse** (when config.use_mhc=True)
+   - Expansion: [S, B, D] → [n, S, B, D] at the start of forward
+   - Collapse: [n, S, B, D] → [S, B, D] at the end of forward via learned stream_proj
+   - The final LayerNorm in the parent operates per-stream (dim=-1 = D), which is correct
+
+2. **Engram module attachment** at specific layer positions
+   - EngramModule instances are created and attached to MHCTransformerLayer objects
+   - at the layer IDs specified in engram_config.engram_layer_ids
+
+3. **input_ids propagation** for Engram
+   - input_ids is temporarily stored on each MHCTransformerLayer before the parent forward
+   - Cleared unconditionally in a finally block
+   - Thread-safe for standard sequential Megatron training
+
+Input/output contract:
+  - forward() accepts and returns [S, B, D] when mHC is enabled, same as TransformerBlock
+  - This keeps FujiBlock as a drop-in replacement for TransformerBlock in FujiModel
+
+Pipeline parallel notes:
+  - Per-stage mHC: streams are expanded at the start of each stage's forward and collapsed
+    at the end. This simplifies inter-stage communication (no n× overhead) at the cost
+    of re-initializing streams at every stage boundary.
+  - Future work can pass [n, S, B, D] between stages for full cross-stage stream continuity.
+"""
+
+from typing import Optional, Union
+
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+from megatron.core.models.engram.engram_module import EngramConfig, EngramModule
+from megatron.core.models.fuji.mhc_transformer_layer import MHCTransformerLayer
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.spec_utils import ModuleSpec
+
+
+class FujiBlock(TransformerBlock):
+    """TransformerBlock subclass for the Fuji architecture (mHC + Engram).
+
+    The block's forward pass keeps the [S, B, D] interface identical to
+    TransformerBlock; stream expansion/collapse is managed internally.
+
+    Args:
+        config:          TransformerConfig (must contain use_mhc / mhc_* / use_engram fields).
+        spec:            Layer spec — should reference MHCTransformerLayer.
+        engram_config:   Optional EngramConfig.  When provided and config.use_engram is True,
+                         EngramModules are attached to layers listed in
+                         engram_config.engram_layer_ids.
+        post_layer_norm: Forwarded to TransformerBlock.
+        pre_process:     Forwarded to TransformerBlock.
+        post_process:    Forwarded to TransformerBlock.
+        pg_collection:   Forwarded to TransformerBlock.
+        vp_stage:        Forwarded to TransformerBlock.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        spec: Union[TransformerBlockSubmodules, ModuleSpec],
+        engram_config: Optional[EngramConfig] = None,
+        post_layer_norm: bool = True,
+        pre_process: bool = True,
+        post_process: bool = True,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            config=config,
+            spec=spec,
+            post_layer_norm=post_layer_norm,
+            pre_process=pre_process,
+            post_process=post_process,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+        )
+
+        # mHC stream-collapse projection: [n*D] → [D]
+        # Initialised to equal-weight average so that at start of training the
+        # collapsed output equals the embedding (all n streams start identical).
+        self.stream_proj: Optional[nn.Linear] = None
+        if getattr(config, 'use_mhc', False):
+            n = config.mhc_num_streams
+            D = config.hidden_size
+            self.stream_proj = nn.Linear(n * D, D, bias=False)
+            with torch.no_grad():
+                # Each D-dim output = mean of the corresponding D-dim slice from each stream
+                w = torch.zeros(D, n * D)
+                for s in range(n):
+                    w[:, s * D:(s + 1) * D] = torch.eye(D) / n
+                self.stream_proj.weight.copy_(w)
+
+        # Attach Engram modules to the appropriate layers
+        if engram_config is not None and getattr(config, 'use_engram', False):
+            self._attach_engram_modules(config, engram_config)
+
+    # ------------------------------------------------------------------
+    # Engram attachment helpers
+    # ------------------------------------------------------------------
+
+    def _attach_engram_modules(
+        self, config: TransformerConfig, engram_config: EngramConfig
+    ) -> None:
+        """Instantiate and attach EngramModule to each eligible layer."""
+        target_layer_ids = set(engram_config.engram_layer_ids)
+        for layer in self.layers:
+            if not isinstance(layer, MHCTransformerLayer):
+                continue
+            # layer.layer_number is 1-indexed; convert to 0-indexed global ID
+            layer_idx = layer.layer_number - 1
+            if layer_idx in target_layer_ids:
+                layer.engram = EngramModule(
+                    config=engram_config,
+                    layer_id=layer_idx,
+                    hidden_size=config.hidden_size,
+                )
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(  # type: ignore[override]
+        self,
+        hidden_states: Tensor,
+        attention_mask,
+        input_ids: Optional[Tensor] = None,
+        **kwargs,
+    ):
+        """Forward pass.
+
+        Args:
+            hidden_states: Shape [S, B, D] (same as standard TransformerBlock).
+            attention_mask: Attention mask.
+            input_ids:     Token IDs [B, S] for Engram lookup.  May be None if
+                           no Engram module is active in this block.
+            **kwargs:      Forwarded to TransformerBlock.forward.
+
+        Returns:
+            Output hidden states [S, B, D] (mHC streams managed internally).
+        """
+        use_mhc = getattr(self.config, 'use_mhc', False)
+
+        # --- mHC: expand [S, B, D] → [n, S, B, D] ---
+        if use_mhc:
+            n = self.config.mhc_num_streams
+            if self.pre_process:
+                # Expand the passed hidden_states
+                hidden_states = hidden_states.unsqueeze(0).expand(n, -1, -1, -1).contiguous()
+            else:
+                # In non-pre_process stages TransformerBlock.forward() uses
+                # self.input_tensor; expand that instead.
+                if self.input_tensor is not None:
+                    self.input_tensor = (
+                        self.input_tensor.unsqueeze(0).expand(n, -1, -1, -1).contiguous()
+                    )
+
+        # --- Inject input_ids for Engram ---
+        if input_ids is not None:
+            for layer in self.layers:
+                if isinstance(layer, MHCTransformerLayer):
+                    layer._current_input_ids = input_ids
+
+        try:
+            result = super().forward(hidden_states, attention_mask, **kwargs)
+        finally:
+            # Clear even on exception
+            for layer in self.layers:
+                if isinstance(layer, MHCTransformerLayer):
+                    layer._current_input_ids = None
+
+        # --- mHC: collapse [n, S, B, D] → [S, B, D] ---
+        if use_mhc and self.stream_proj is not None:
+            # result may be (hidden_states,) or (hidden_states, intermediate_states)
+            if isinstance(result, tuple):
+                h, extra = result[0], result[1:]
+            else:
+                h, extra = result, None
+
+            n_actual = h.shape[0]
+            S, B, D = h.shape[1], h.shape[2], h.shape[3]
+            # Permute to [S, B, n, D] then flatten to [S, B, n*D]
+            h = h.permute(1, 2, 0, 3).reshape(S, B, n_actual * D)
+            h = self.stream_proj(h)  # [S, B, D]
+
+            if extra is not None:
+                return (h,) + extra
+            return h
+
+        return result
