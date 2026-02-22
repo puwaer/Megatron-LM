@@ -28,7 +28,7 @@ Pipeline parallel notes:
   - Future work can pass [n, S, B, D] between stages for full cross-stage stream continuity.
 """
 
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import torch
 import torch.nn as nn
@@ -36,8 +36,14 @@ from torch import Tensor
 
 from megatron.core.models.engram.engram_module import EngramConfig, EngramModule
 from megatron.core.models.fuji.mhc_transformer_layer import MHCTransformerLayer
+from megatron.core.models.fuji.fuji_hybrid_decoder_layer import FujiLinearAttentionDecoderLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
+from megatron.core.transformer.transformer_block import (
+    TransformerBlock,
+    TransformerBlockSubmodules,
+    get_num_layers_to_build,
+)
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 
@@ -72,6 +78,69 @@ class FujiBlock(TransformerBlock):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
+        # ----------------------------------------------------------------------
+        # Hybrid layer logic (GatedDeltaNet + Full Attention)
+        # ----------------------------------------------------------------------
+        if getattr(config, 'experimental_attention_variant', None) == 'gated_delta_net':
+            # Calculate layer offset and count for this stage
+            offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+            num_layers = get_num_layers_to_build(config, vp_stage=vp_stage)
+
+            # Determine hybrid pattern (default: one full attention every 4 layers)
+            full_interval = getattr(config, 'full_attention_interval', 4)
+
+            # Convert input spec to a list of specs (one per layer)
+            if isinstance(spec, TransformerBlockSubmodules):
+                if spec.layer_specs is None:
+                    # If generic spec, replicate for all layers (all Full Attn initially)
+                    # We create a dummy list that we will overwrite
+                    # This case assumes spec.layer_specs is NOT used yet.
+                    # Actually spec contains submodules definition.
+                    # We need to construct a list of ModuleSpecs.
+                    # But wait, how do we get the ModuleSpec for the "standard" layer?
+                    # TransformerBlockSubmodules doesn't contain the ModuleSpec of the layer class itself,
+                    # just the submodules of that layer.
+                    # Using TransformerBlockSubmodules directly implicitly uses the default layer class
+                    # (which is MHCTransformerLayer in our case).
+                    # We need to create specific ModuleSpecs.
+                    base_full_attn_spec = ModuleSpec(module=MHCTransformerLayer, submodules=spec)
+                    layer_specs = [base_full_attn_spec for _ in range(num_layers)]
+                else:
+                    layer_specs = list(spec.layer_specs)
+            else:
+                # specific ModuleSpec provided
+                layer_specs = [spec for _ in range(num_layers)]
+
+            # Override linear attention layers
+            for i in range(num_layers):
+                layer_idx = i + offset
+                is_linear = ((layer_idx + 1) % full_interval) != 0
+
+                if is_linear:
+                    # Determine MoE usage for this layer
+                    # Standard logic: MoE if (layer_idx + 1) % frequency == 0
+                    use_moe = False
+                    if getattr(config, 'num_moe_experts', 0) > 0:
+                        freq = getattr(config, 'moe_layer_freq', 1)
+                        if (layer_idx + 1) % freq == 0:
+                            use_moe = True
+                        
+                        # Check explicitly excluded layers (mlp_only_layers)
+                        mlp_only_layers = getattr(config, 'mlp_only_layers', [])
+                        if layer_idx in mlp_only_layers:
+                            use_moe = False
+
+                    # Create linear attention spec
+                    # FujiLinearAttentionDecoderLayer(config, layer_number, mlp_only=bool)
+                    mlp_only = not use_moe
+                    layer_specs[i] = ModuleSpec(
+                        module=FujiLinearAttentionDecoderLayer,
+                        params={"mlp_only": mlp_only},
+                    )
+
+            # Update spec to use the new per-layer specs
+            spec = TransformerBlockSubmodules(layer_specs=layer_specs)
+
         super().__init__(
             config=config,
             spec=spec,

@@ -74,6 +74,7 @@ class FujiLinearAttentionDecoderLayer(nn.Module):
         config: TransformerConfig,
         layer_number: int,
         mlp_only: bool = False,
+        **kwargs,
     ) -> None:
         super().__init__()
         self.config = config
