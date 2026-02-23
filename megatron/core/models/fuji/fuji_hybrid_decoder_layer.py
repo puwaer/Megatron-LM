@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.models.engram.engram_module import EngramModule
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.models.fuji.fuji_gated_delta_net import (
     FujiGatedDeltaNet,
     GatedDeltaNetInferenceCache,
@@ -53,7 +54,7 @@ class _RMSNorm(nn.Module):
 # Hybrid linear attention decoder layer
 # ──────────────────────────────────────────────────────────────────────────────
 
-class FujiLinearAttentionDecoderLayer(nn.Module):
+class FujiLinearAttentionDecoderLayer(MegatronModule):
     """Complete decoder layer using GatedDeltaNet linear attention.
 
     Drop-in companion to MHCTransformerLayer inside FujiBlock.  The public
@@ -76,8 +77,7 @@ class FujiLinearAttentionDecoderLayer(nn.Module):
         mlp_only: bool = False,
         **kwargs,
     ) -> None:
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.layer_number = layer_number        # 1-indexed (Megatron convention)
         self.layer_idx = layer_number - 1       # 0-indexed (used for cache)
 
