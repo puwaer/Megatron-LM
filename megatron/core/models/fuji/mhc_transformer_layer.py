@@ -8,11 +8,11 @@ Hidden-state convention inside FujiBlock:
     Standard Megatron: [S, B, D]
     mHC multi-stream:  [n, S, B, D]
 
-At the layer boundary:
-  1. aggregate_streams: [n,S,B,D] → [S,B,D]      (weighted sum via softmax(H_pre))
+At the layer boundary (MHC-Lite):
+  1. width_connection: [n,S,B,D] → [S,B,D]       (input-gated aggregation + permutation mix)
   2. (optional Engram)
   3. Standard TransformerLayer forward: [S,B,D] → [S,B,D]
-  4. distribute_output: [n,S,B,D] + [S,B,D] → [n,S,B,D]  (H_res + H_post)
+  4. depth_connection: [S,B,D] → [n,S,B,D]        (beta-gated distribution + mixed residuals)
 
 When use_mhc=False the layer behaves identically to a standard TransformerLayer.
 """
@@ -78,6 +78,7 @@ class MHCTransformerLayer(TransformerLayer):
             self.mhc = ManifoldConstrainedHyperConnection(
                 hidden_size=config.hidden_size,
                 num_streams=config.mhc_num_streams,
+                layer_index=layer_number,
                 sinkhorn_iterations=config.mhc_sinkhorn_iterations,
             )
 
@@ -111,9 +112,10 @@ class MHCTransformerLayer(TransformerLayer):
         input_ids: Optional[Tensor] = getattr(self, '_current_input_ids', None)
 
         if self.mhc is not None:
-            # --- mHC path ---
-            # 1. Aggregate n streams into a single layer input
-            x_in = self.mhc.aggregate_streams(hidden_states)  # [S, B, D]
+            # --- MHC-Lite path ---
+            # 1. Width connection: get branch input and depth-connection closure
+            #    Captures mixed residuals and beta inside add_residual.
+            x_in, add_residual = self.mhc(hidden_states)   # [S,B,D], closure
 
             # 2. Optional Engram memory injection
             if self.engram is not None and input_ids is not None:
@@ -122,8 +124,8 @@ class MHCTransformerLayer(TransformerLayer):
             # 3. Standard TransformerLayer computation (internal attention + MLP residuals)
             x_out, context = super().forward(x_in, **kwargs)  # [S, B, D]
 
-            # 4. Distribute layer output back to n streams
-            hidden_states = self.mhc.distribute_output(hidden_states, x_out)  # [n,S,B,D]
+            # 4. Depth connection: distribute layer output back to n streams
+            hidden_states = add_residual(x_out)             # [n, S, B, D]
         else:
             # --- Standard path (mHC disabled) ---
             if self.engram is not None and input_ids is not None:
