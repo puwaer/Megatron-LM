@@ -52,7 +52,7 @@ def _get_permutation_matrices(n: int, device: torch.device) -> Tensor:
     if key not in _perm_mats_cache:
         perms = list(itertools.permutations(range(n)))   # identity first
         idx = torch.tensor(perms, dtype=torch.long)
-        eye = torch.eye(n, dtype=torch.float32)
+        eye = torch.eye(n, dtype=torch.bfloat16)
         perm_mats = eye[idx]                             # [n!, n, n]
         _perm_mats_cache[key] = perm_mats.to(device)
     return _perm_mats_cache[key]
