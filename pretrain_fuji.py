@@ -181,10 +181,14 @@ def add_fuji_args(parser):
                        help='Maximum n-gram size for Engram.')
     group.add_argument('--engram-n-embed-per-ngram', type=int, default=512,
                        help='Embedding size per n-gram for Engram.')
-    group.add_argument('--engram-n-head-per_ngram', type=int, default=8,
+    group.add_argument('--engram-n-head-per-ngram', type=int, default=8,
                        help='Number of heads per n-gram for Engram.')
     group.add_argument('--engram-layer-ids', nargs='+', type=int, default=None,
                        help='Layer IDs where Engram is enabled.')
+    group.add_argument('--engram-seed', type=int, default=0,
+                       help='Seed for deterministic Engram hash multiplier generation.')
+    group.add_argument('--engram-base-vocab-size', type=int, default=None,
+                       help='Vocabulary size used by Engram tokenizer compression. Defaults to padded_vocab_size.')
 
     return parser
 
