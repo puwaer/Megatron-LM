@@ -98,11 +98,11 @@ def _chunk_gated_delta_rule(
     chunk_size: int = 64,
     initial_state: Optional[Tensor] = None,
     output_final_state: bool = False,
-    use_qk_l2norm: bool = True,
+    use_qk_l2norm_in_kernel: bool = True,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """Pure-PyTorch chunked GatedDeltaRule recurrence."""
     init_dtype = query.dtype
-    if use_qk_l2norm:
+    if use_qk_l2norm_in_kernel:
         query = _l2norm(query)
         key = _l2norm(key)
     # [B, S, H, D] → [B, H, S, D]
@@ -170,11 +170,11 @@ def _recurrent_gated_delta_rule(
     beta: Tensor,
     initial_state: Optional[Tensor] = None,
     output_final_state: bool = False,
-    use_qk_l2norm: bool = True,
+    use_qk_l2norm_in_kernel: bool = True,
 ) -> Tuple[Tensor, Optional[Tensor]]:
     """Pure-PyTorch token-by-token GatedDeltaRule for inference."""
     init_dtype = query.dtype
-    if use_qk_l2norm:
+    if use_qk_l2norm_in_kernel:
         query = _l2norm(query)
         key = _l2norm(key)
     query, key, value, beta, g = [
