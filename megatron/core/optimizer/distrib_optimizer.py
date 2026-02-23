@@ -901,7 +901,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 tensors[k] = self.optimizer.get_unscaled_state(sharded_model_param, k)
-            tensors["param"] = tensors.pop("master_param")
+            if "master_param" in tensors:
+                tensors["param"] = tensors.pop("master_param")
+            else:
+                # bf16 direct update mode (TE >= 2.1.0 with main_params_dtype=bf16):
+                # no separate master copy; sharded_model_param IS the param to checkpoint.
+                tensors["param"] = sharded_model_param
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
@@ -929,7 +934,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 if k == "param":
-                    self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
+                    param_state = self.optimizer.state.get(sharded_model_param, {})
+                    if "master_param" in param_state:
+                        self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
+                    else:
+                        # bf16 direct update mode: no master_param; restore directly.
+                        sharded_model_param.data.copy_(v)
                 else:
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
         else:
