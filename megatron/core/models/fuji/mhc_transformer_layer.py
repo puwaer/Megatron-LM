@@ -87,6 +87,40 @@ class MHCTransformerLayer(TransformerLayer):
         # Engram module — None for layers where Engram is not applied
         self.engram: Optional[EngramModule] = engram_module
 
+        # ------------------------------------------------------------------
+        # Phase 4 — PP async overlap: dedicated CUDA stream + event pairs
+        #
+        # _mhc_stream (priority=-1, high): executes width_connection and
+        #     depth_connection so that their SM kernels can overlap with
+        #     concurrent NCCL DMA activity on the default compute stream.
+        #
+        # Overlap model (PP ≥ 2):
+        #   after forward() returns, the PP schedule immediately calls
+        #   send_forward (NCCL P2P → DMA engine).  depth_connection was
+        #   already dispatched to _mhc_stream; the event barrier
+        #   (current_stream.wait_event(_mhc_event_d)) guarantees that
+        #   hidden_states is fully computed before send_forward reads it,
+        #   but the NCCL DMA and the NEXT layer's width_connection can
+        #   start concurrently on independent hardware engines.
+        # ------------------------------------------------------------------
+        self._mhc_stream: Optional[torch.cuda.Stream] = None
+        self._mhc_event_w: Optional[torch.cuda.Event] = None
+        self._mhc_event_d: Optional[torch.cuda.Event] = None
+
+        if (
+            getattr(config, 'use_mhc', False)
+            and getattr(config, 'mhc_async_pp_overlap', False)
+            and torch.cuda.is_available()
+        ):
+            # priority=-1 → high priority; typical NCCL/compute streams use 0.
+            # High priority allows the CUDA scheduler to issue mHC SM kernels
+            # as soon as the dependency event is satisfied, even while lower-
+            # priority streams have pending work.
+            self._mhc_stream = torch.cuda.Stream(priority=-1)
+            # enable_timing=False keeps event overhead < 1 μs
+            self._mhc_event_w = torch.cuda.Event(enable_timing=False)
+            self._mhc_event_d = torch.cuda.Event(enable_timing=False)
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -119,7 +153,62 @@ class MHCTransformerLayer(TransformerLayer):
                 getattr(self.config, 'mhc_selective_recompute', False) and self.training
             )
 
-            if use_selective:
+            if self._mhc_stream is not None:
+                # -------------------------------------------------------
+                # Phase 4: async PP-overlap path
+                # Stream topology:
+                #   _mhc_stream  (high priority): width_conn, depth_conn
+                #   current_stream (normal prio): Engram, TransformerLayer,
+                #                                 PP NCCL send/recv
+                #
+                # Barrier sequence:
+                #   _mhc_stream.wait_stream(cur)  — X must be visible
+                #   width_conn on _mhc_stream
+                #   _mhc_event_w.record(_mhc_stream)
+                #   cur.wait_event(_mhc_event_w)  — x_in must be visible
+                #   Engram + TransformerLayer on cur
+                #   _mhc_stream.wait_stream(cur)  — x_out must be visible
+                #   depth_conn on _mhc_stream
+                #   _mhc_event_d.record(_mhc_stream)
+                #   cur.wait_event(_mhc_event_d)  — hidden_states ready
+                #
+                # After return, the PP schedule immediately issues send_forward
+                # (NCCL DMA on DMA engine).  The NEXT layer's width_conn starts
+                # on _mhc_stream concurrently on the SM — true HW parallelism.
+                # -------------------------------------------------------
+                cur = torch.cuda.current_stream()
+
+                # ---- Width connection on _mhc_stream ----
+                self._mhc_stream.wait_stream(cur)        # X [n,S,B,D] is ready
+                with torch.cuda.stream(self._mhc_stream):
+                    if use_selective:
+                        # Discard new_residuals/beta from autograd tape;
+                        # MHCSelectiveCheckpoint recomputes them in backward.
+                        x_in, _, _ = self.mhc._width_connection(hidden_states)
+                    else:
+                        x_in, add_residual = self.mhc(hidden_states)
+                self._mhc_event_w.record(self._mhc_stream)
+                cur.wait_event(self._mhc_event_w)        # x_in [S,B,D] is ready
+
+                # ---- Optional Engram + standard TransformerLayer (on cur) ----
+                if self.engram is not None and input_ids is not None:
+                    x_in = x_in + self.engram(input_ids, x_in)   # [S, B, D]
+
+                x_out, context = super().forward(x_in, **kwargs)  # [S, B, D]
+
+                # ---- Depth connection on _mhc_stream ----
+                self._mhc_stream.wait_stream(cur)        # x_out [S,B,D] is ready
+                with torch.cuda.stream(self._mhc_stream):
+                    if use_selective:
+                        hidden_states = MHCSelectiveCheckpoint.apply(
+                            hidden_states, x_out, self.mhc
+                        )                                          # [n, S, B, D]
+                    else:
+                        hidden_states = add_residual(x_out)        # [n, S, B, D]
+                self._mhc_event_d.record(self._mhc_stream)
+                cur.wait_event(self._mhc_event_d)        # hidden_states ready
+
+            elif use_selective:
                 # Selective recompute path: save only X + x_out; discard intermediates.
                 # 1. Width connection with autograd: gets branch_input (x_in);
                 #    new_residuals and beta are discarded, freeing H_res/res_coeff

@@ -958,6 +958,33 @@ class TransformerConfig(ModelParallelConfig):
     HBM round-trips for these intermediates.  Falls back to PyTorch when Triton
     is unavailable, the device is CPU, or n != 4.  Requires bfloat16."""
 
+    mhc_async_pp_overlap: bool = False
+    """When True, run mHC width and depth connections on a dedicated high-priority
+    CUDA stream to enable overlap with pipeline-parallel (PP) P2P communication.
+
+    Overlap model (PP ≥ 2):
+      - NCCL P2P transfers (send_forward / recv_forward) occupy the DMA/copy engine.
+      - mHC SM kernels (width_connection, depth_connection) run on the SM compute engine.
+      - Both engines are independent hardware units and can execute concurrently.
+
+    Stream topology per MHCTransformerLayer:
+      _mhc_stream  (priority = -1, high): runs width_connection and depth_connection.
+      current_stream (priority =  0):     runs TransformerLayer (attn + MLP) and
+                                          PP NCCL send/recv operations.
+
+    Synchronisation barriers (CUDA event pairs):
+      _mhc_event_w: records after width_connection  → current_stream.wait_event
+      _mhc_event_d: records after depth_connection  → current_stream.wait_event
+
+    Net effect per layer call:
+      width_connection and Transformer compute are serialised (event barrier).
+      depth_connection and the SUBSEQUENT PP send DMA CAN overlap when the PP
+      schedule issues send_forward immediately after forward() returns — the
+      DMA engine starts while the SM is already running the next recv or compute.
+
+    Prerequisites: PP ≥ 2, CUDA device, use_mhc = True.
+    Overhead when PP = 1: two stream-wait + two event-record per layer (< 1 μs)."""
+
     ####################
     # Engram (Conditional Memory via Scalable Lookup)
     ####################
