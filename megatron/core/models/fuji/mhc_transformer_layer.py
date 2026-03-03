@@ -25,6 +25,7 @@ from torch import Tensor
 from megatron.core.models.engram.engram_module import EngramModule
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.mhc import ManifoldConstrainedHyperConnection
+from megatron.core.transformer.mhc_checkpoint import MHCSelectiveCheckpoint
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
@@ -80,6 +81,7 @@ class MHCTransformerLayer(TransformerLayer):
                 num_streams=config.mhc_num_streams,
                 layer_index=layer_number,
                 sinkhorn_iterations=config.mhc_sinkhorn_iterations,
+                use_fused_kernel=getattr(config, 'mhc_use_fused_kernel', False),
             )
 
         # Engram module — None for layers where Engram is not applied
@@ -113,19 +115,43 @@ class MHCTransformerLayer(TransformerLayer):
 
         if self.mhc is not None:
             # --- MHC-Lite path ---
-            # 1. Width connection: get branch input and depth-connection closure
-            #    Captures mixed residuals and beta inside add_residual.
-            x_in, add_residual = self.mhc(hidden_states)   # [S,B,D], closure
+            use_selective = (
+                getattr(self.config, 'mhc_selective_recompute', False) and self.training
+            )
 
-            # 2. Optional Engram memory injection
-            if self.engram is not None and input_ids is not None:
-                x_in = x_in + self.engram(input_ids, x_in)   # [S, B, D]
+            if use_selective:
+                # Selective recompute path: save only X + x_out; discard intermediates.
+                # 1. Width connection with autograd: gets branch_input (x_in);
+                #    new_residuals and beta are discarded, freeing H_res/res_coeff
+                #    from the autograd tape (no downstream use of those outputs).
+                x_in, _, _ = self.mhc._width_connection(hidden_states)  # [S,B,D]
 
-            # 3. Standard TransformerLayer computation (internal attention + MLP residuals)
-            x_out, context = super().forward(x_in, **kwargs)  # [S, B, D]
+                # 2. Optional Engram memory injection
+                if self.engram is not None and input_ids is not None:
+                    x_in = x_in + self.engram(input_ids, x_in)   # [S, B, D]
 
-            # 4. Depth connection: distribute layer output back to n streams
-            hidden_states = add_residual(x_out)             # [n, S, B, D]
+                # 3. Standard TransformerLayer computation
+                x_out, context = super().forward(x_in, **kwargs)  # [S, B, D]
+
+                # 4. Depth connection via custom Function (backward recomputes width)
+                hidden_states = MHCSelectiveCheckpoint.apply(
+                    hidden_states, x_out, self.mhc
+                )                                                   # [n, S, B, D]
+            else:
+                # Standard closure path (retains all intermediates in autograd graph)
+                # 1. Width connection: get branch input and depth-connection closure
+                #    Captures mixed residuals and beta inside add_residual.
+                x_in, add_residual = self.mhc(hidden_states)   # [S,B,D], closure
+
+                # 2. Optional Engram memory injection
+                if self.engram is not None and input_ids is not None:
+                    x_in = x_in + self.engram(input_ids, x_in)   # [S, B, D]
+
+                # 3. Standard TransformerLayer computation (internal attention + MLP residuals)
+                x_out, context = super().forward(x_in, **kwargs)  # [S, B, D]
+
+                # 4. Depth connection: distribute layer output back to n streams
+                hidden_states = add_residual(x_out)             # [n, S, B, D]
         else:
             # --- Standard path (mHC disabled) ---
             if self.engram is not None and input_ids is not None:

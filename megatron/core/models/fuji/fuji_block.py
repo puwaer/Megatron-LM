@@ -28,6 +28,7 @@ Pipeline parallel notes:
   - Future work can pass [n, S, B, D] between stages for full cross-stage stream continuity.
 """
 
+import math
 from typing import Optional, Union, List
 
 import torch
@@ -140,6 +141,14 @@ class FujiBlock(TransformerBlock):
 
             # Update spec to use the new per-layer specs
             spec = TransformerBlockSubmodules(layer_specs=layer_specs)
+
+        # Auto-compute optimal recompute_num_layers (L_r*) when requested.
+        # L_r* = round(sqrt(n * L / (n + 2))) minimises peak transient memory
+        # during the backward pass under uniform recomputation.
+        if getattr(config, 'mhc_auto_recompute_num_layers', False) and getattr(config, 'use_mhc', False):
+            n = config.mhc_num_streams
+            L = config.num_layers
+            config.recompute_num_layers = max(1, round(math.sqrt(n * L / (n + 2))))
 
         super().__init__(
             config=config,

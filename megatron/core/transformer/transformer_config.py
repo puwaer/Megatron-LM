@@ -939,6 +939,25 @@ class TransformerConfig(ModelParallelConfig):
     """Number of Sinkhorn-Knopp iterations for projecting the residual mixing matrix H_res onto
     the doubly stochastic manifold (Birkhoff polytope). 20 iterations typically suffice."""
 
+    mhc_selective_recompute: bool = False
+    """When True and training, use selective recomputation for mHC width/depth connections.
+    The forward pass discards new_residuals, beta, and all intermediate tensors
+    (H_res, normed, wc, res_coeff) from the autograd graph.  The backward pass
+    recomputes _width_connection on-the-fly from the saved X and x_out tensors.
+    Memory saving: ~8196·S·B elements per layer (n=4, D=2048)."""
+
+    mhc_auto_recompute_num_layers: bool = False
+    """When True and use_mhc=True, automatically set recompute_num_layers to the
+    theoretically optimal value L_r* = round(sqrt(n*L/(n+2))), which minimises
+    peak transient memory during the backward pass under uniform recompute.
+    For n=4, L=12 this gives L_r* = 3 (four blocks of three layers each)."""
+
+    mhc_use_fused_kernel: bool = False
+    """When True, use the fused Triton kernel for the mHC width connection forward
+    pass.  The kernel keeps normed, wc, H_res, and res_coeff in SRAM, avoiding
+    HBM round-trips for these intermediates.  Falls back to PyTorch when Triton
+    is unavailable, the device is CPU, or n != 4.  Requires bfloat16."""
+
     ####################
     # Engram (Conditional Memory via Scalable Lookup)
     ####################

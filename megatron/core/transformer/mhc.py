@@ -104,10 +104,12 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         num_streams: int,
         layer_index: Optional[int] = None,
         sinkhorn_iterations: int = 20,   # unused, kept for API compat
+        use_fused_kernel: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.num_streams = num_streams
+        self.use_fused_kernel = use_fused_kernel
         n = num_streams
         num_perms = math.factorial(n)
         self.num_perms = num_perms
@@ -159,6 +161,10 @@ class ManifoldConstrainedHyperConnection(nn.Module):
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute branch input, permutation-mixed residuals, and beta.
 
+        When ``self.use_fused_kernel`` is True and Triton is available, uses
+        the fused kernel from :mod:`megatron.core.fusions.fused_mhc_width_connection`
+        to keep intermediate tensors (normed, wc, H_res, res_coeff) in SRAM.
+
         Args:
             X: Multi-stream hidden states [n, S, B, D].
 
@@ -168,7 +174,26 @@ class ManifoldConstrainedHyperConnection(nn.Module):
             beta:           [S, B, n]    — depth-connection gate weights.
         """
         n, S, B, D = X.shape
+        perms = _get_permutation_matrices(n, X.device)  # [n!, n, n]
 
+        if self.use_fused_kernel:
+            from megatron.core.fusions.fused_mhc_width_connection import (
+                fused_mhc_width_connection,
+            )
+            return fused_mhc_width_connection(
+                X,
+                self.dynamic_alpha_fn,
+                self.dynamic_beta_fn,
+                self.static_alpha,
+                self.static_beta,
+                self.norm.gamma,
+                perms,
+                self.pre_branch_scale,
+                self.residual_scale,
+                self.h_post_scale,
+            )
+
+        # ---- Standard PyTorch path ----------------------------------------
         # Rearrange to [S, B, n, D] and flatten streams for norm
         X_sb = X.permute(1, 2, 0, 3)                 # [S, B, n, D]
         normed = X_sb.reshape(S, B, n * D)            # [S, B, n*D]
@@ -189,7 +214,6 @@ class ManifoldConstrainedHyperConnection(nn.Module):
             self.residual_scale * dynamic_res + self.static_alpha[n:],
             dim=-1,
         )                                             # [S, B, n!]
-        perms = _get_permutation_matrices(n, X.device)           # [n!, n, n]
         H_res = torch.einsum('...r, rij -> ...ij', res_coeff, perms)  # [S, B, n, n]
 
         # Apply H_res: new_residuals[..., i, :] = Σ_j H_res[..., i, j] * X[..., j, :]
