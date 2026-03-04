@@ -272,9 +272,12 @@ class FujiGatedDeltaNet(nn.Module):
         self.in_proj_qkvz = nn.Linear(self.hidden_size, proj_qkvz, bias=False)
         self.in_proj_ba   = nn.Linear(self.hidden_size, proj_ba,   bias=False)
 
-        # Learnable time-step and decay parameters
-        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
-        A = torch.empty(self.num_v_heads).uniform_(0, 16)
+        # Learnable time-step and decay parameters.
+        # A ~ U[0.001, 0.016] → per-step g ≈ -0.007, cumsum(64) ≈ -0.45,
+        # exp(-0.45) ≈ 0.64: healthy cross-chunk state decay.
+        # (Previously A ~ U[0, 16] → cumsum(64) ≈ -672, exp(-672) ≈ 0: state zeroed.)
+        self.dt_bias = nn.Parameter(torch.zeros(self.num_v_heads))
+        A = torch.empty(self.num_v_heads).uniform_(0.001, 0.016)
         self.A_log  = nn.Parameter(A.log())
 
         # Output normalisation (RMSNorm + gating)

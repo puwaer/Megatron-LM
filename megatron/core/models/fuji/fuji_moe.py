@@ -173,8 +173,10 @@ class FujiSparseMoE(nn.Module):
         hidden          = config.hidden_size
         moe_inter       = getattr(config, 'moe_intermediate_size', 512)
         shared_inter    = getattr(config, 'shared_expert_intermediate_size', 512)
-        num_experts     = getattr(config, 'num_experts', 64)
-        num_experts_tok = getattr(config, 'num_experts_per_tok', 2)
+        # Megatron stores these as num_moe_experts / moe_router_topk; fall back to
+        # the legacy attribute names for configs that use them directly.
+        num_experts     = getattr(config, 'num_moe_experts', getattr(config, 'num_experts', 64))
+        num_experts_tok = getattr(config, 'moe_router_topk', getattr(config, 'num_experts_per_tok', 2))
         norm_topk       = getattr(config, 'norm_topk_prob', True)
 
         self.gate = FujiTopKRouter(

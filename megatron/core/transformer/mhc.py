@@ -145,8 +145,10 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         # Depth-connection parameters (beta / H_post)
         #   beta = sigmoid(h_post_scale * normed @ W_beta + b_beta) * 2
         # ------------------------------------------------------------------
-        init_beta = torch.ones(n) * -1.0
-        init_beta[init_idx] = 1.0
+        # Initialize beta ≈ 0 so depth connection starts as pure residual.
+        # sigmoid(-8)*2 ≈ 0.00067 → per-layer eigenvalue ≈ 1.001
+        # Over 48 layers: 1.001^48 ≈ 1.05 (stable), vs 2.503^48 ≈ 1.6E19 before.
+        init_beta = torch.ones(n) * -8.0
         self.static_beta = nn.Parameter(init_beta)
 
         # Dynamic component: [n*D] → [n]
