@@ -52,7 +52,7 @@ def _get_permutation_matrices(n: int, device: torch.device) -> Tensor:
     if key not in _perm_mats_cache:
         perms = list(itertools.permutations(range(n)))   # identity first
         idx = torch.tensor(perms, dtype=torch.long)
-        eye = torch.eye(n, dtype=torch.bfloat16)
+        eye = torch.eye(n, dtype=torch.float32)
         perm_mats = eye[idx]                             # [n!, n, n]
         _perm_mats_cache[key] = perm_mats.to(device)
     return _perm_mats_cache[key]
@@ -65,13 +65,14 @@ def _get_permutation_matrices(n: int, device: torch.device) -> Tensor:
 class _RMSNorm(nn.Module):
     """RMSNorm used for stream normalisation inside MHC-Lite."""
 
-    def __init__(self, dim: int) -> None:
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.scale = dim ** 0.5
-        self.gamma = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.normalize(x, dim=-1) * self.scale * (self.gamma + 1)
+        out = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        return (out * (1.0 + self.weight.float())).type_as(x)
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +187,7 @@ class ManifoldConstrainedHyperConnection(nn.Module):
                 self.dynamic_beta_fn,
                 self.static_alpha,
                 self.static_beta,
-                self.norm.gamma,
+                self.norm.weight,
                 perms,
                 self.pre_branch_scale,
                 self.residual_scale,
@@ -214,7 +215,7 @@ class ManifoldConstrainedHyperConnection(nn.Module):
             self.residual_scale * dynamic_res + self.static_alpha[n:],
             dim=-1,
         )                                             # [S, B, n!]
-        H_res = torch.einsum('...r, rij -> ...ij', res_coeff, perms)  # [S, B, n, n]
+        H_res = torch.einsum('...r, rij -> ...ij', res_coeff, perms.to(res_coeff.dtype))  # [S, B, n, n]
 
         # Apply H_res: new_residuals[..., i, :] = Σ_j H_res[..., i, j] * X[..., j, :]
         new_residuals = torch.einsum(

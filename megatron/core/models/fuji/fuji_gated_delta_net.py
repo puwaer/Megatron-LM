@@ -107,7 +107,7 @@ def _chunk_gated_delta_rule(
         key = _l2norm(key)
     # [B, S, H, D] → [B, H, S, D]
     query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.bfloat16)
+        x.transpose(1, 2).contiguous().to(torch.float32)
         for x in (query, key, value, beta, g)
     ]
     B, H, S, k_dim = key.shape
@@ -131,7 +131,7 @@ def _chunk_gated_delta_rule(
     g = g.reshape(B, H, -1, chunk_size)
     triu_mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
     g = g.cumsum(dim=-1)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().bfloat16()).tril()
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
     attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(triu_mask, 0)
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
@@ -141,8 +141,8 @@ def _chunk_gated_delta_rule(
     value = attn @ v_beta
     k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
     state = (
-        torch.zeros(B, H, k_dim, v_dim, device=query.device, dtype=torch.bfloat16)
-        if initial_state is None else initial_state.bfloat16()
+        torch.zeros(B, H, k_dim, v_dim, device=query.device, dtype=torch.float32)
+        if initial_state is None else initial_state.float()
     )
     out = torch.zeros_like(value)
     triu2 = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
@@ -178,17 +178,17 @@ def _recurrent_gated_delta_rule(
         query = _l2norm(query)
         key = _l2norm(key)
     query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.bfloat16)
+        x.transpose(1, 2).contiguous().to(torch.float32)
         for x in (query, key, value, beta, g)
     ]
     B, H, S, k_dim = key.shape
     v_dim = value.shape[-1]
     scale = 1.0 / math.sqrt(k_dim)
     query = query * scale
-    out = torch.zeros(B, H, S, v_dim, device=query.device, dtype=torch.bfloat16)
+    out = torch.zeros(B, H, S, v_dim, device=query.device, dtype=torch.float32)
     state = (
-        torch.zeros(B, H, k_dim, v_dim, device=query.device, dtype=torch.bfloat16)
-        if initial_state is None else initial_state.bfloat16()
+        torch.zeros(B, H, k_dim, v_dim, device=query.device, dtype=torch.float32)
+        if initial_state is None else initial_state.float()
     )
     for t in range(S):
         q_t, k_t, v_t = query[:, :, t], key[:, :, t], value[:, :, t]
@@ -216,11 +216,11 @@ class _RMSNormGated(nn.Module):
 
     def forward(self, x: Tensor, gate: Tensor) -> Tensor:
         dtype = x.dtype
-        x = x.bfloat16()
+        x = x.float()
         var = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
         x = self.weight * x.to(dtype)
-        return x * F.silu(gate.bfloat16()).to(dtype)
+        return x * F.silu(gate.float()).to(dtype)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -401,7 +401,7 @@ class FujiGatedDeltaNet(nn.Module):
 
         # Beta and decay (g)
         beta = b.sigmoid()
-        g = -self.A_log.bfloat16().exp() * F.softplus(a.bfloat16() + self.dt_bias.bfloat16())
+        g = (-self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())).to(a.dtype)
 
         # Expand Q/K if num_v_heads > num_k_heads (grouped)
         ratio = self.num_v_heads // self.num_k_heads
