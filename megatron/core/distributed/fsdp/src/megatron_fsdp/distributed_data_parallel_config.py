@@ -161,6 +161,9 @@ class DistributedDataParallelConfig:
     main_params_dtype: torch.dtype = torch.float32
     """dtype for the main weight buffer in FSDP. Set to torch.bfloat16 to save memory."""
 
+    use_precision_aware_optimizer: bool = False
+    """If true, set param.decoupled_grad instead of param.grad in update_main_grads."""
+
     def __post_init__(self):
         import os
 

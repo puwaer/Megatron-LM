@@ -1627,6 +1627,9 @@ class ParamAndGradBuffer:
         )
         self.ubr_groups = None
         self.already_registered = False
+        self.use_precision_aware_optimizer = getattr(
+            self.ddp_config, 'use_precision_aware_optimizer', False
+        )
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
