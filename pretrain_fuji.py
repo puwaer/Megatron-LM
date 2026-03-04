@@ -56,7 +56,8 @@ def fuji_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
         engram_layer_ids_val = getattr(config, 'engram_layer_ids', None)
         engram_config = EngramConfig(
             max_ngram_size=getattr(config, 'engram_max_ngram_size', 3),
-            n_embed_per_ngram=getattr(config, 'engram_n_embed_per_ngram', 512),
+            n_embed_per_ngram=getattr(config, 'engram_n_embed_per_ngram', 99991),
+            n_embed_dim=getattr(config, 'engram_embed_dim', 672),
             n_head_per_ngram=getattr(config, 'engram_n_head_per_ngram', 8),
             **({"engram_layer_ids": engram_layer_ids_val} if engram_layer_ids_val is not None else {}),
             seed=getattr(config, 'engram_seed', 0),

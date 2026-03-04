@@ -999,8 +999,12 @@ class TransformerConfig(ModelParallelConfig):
     engram_max_ngram_size: int = 3
     """Maximum N-gram size for Engram memory lookup (supports 2-gram up to this size)."""
 
-    engram_n_embed_per_ngram: int = 512
-    """Embedding dimension per N-gram in the Engram multi-head embedding table."""
+    engram_n_embed_per_ngram: int = 99991
+    """Hash table size (prime) per N-gram order. Replaces the hard-coded _DEFAULT_PRIMES
+    in NgramHashMapping. Should be a prime number (e.g. 99991)."""
+
+    engram_embed_dim: int = 672
+    """Embedding dimension per entry in the Engram multi-head embedding table."""
 
     engram_n_head_per_ngram: int = 8
     """Number of hash heads per N-gram for collision resistance in Engram."""

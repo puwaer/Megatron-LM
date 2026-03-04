@@ -62,7 +62,13 @@ class EngramConfig:
     """
 
     max_ngram_size: int = 3
-    n_embed_per_ngram: int = 512
+    n_embed_per_ngram: int = 99991
+    """Hash table size (prime) per N-gram order and head. Used as the modulus in
+    NgramHashMapping. Should be a prime number for good hashing properties."""
+
+    n_embed_dim: int = 512
+    """Embedding dimension for each entry in the multi-head embedding table."""
+
     n_head_per_ngram: int = 8
     engram_layer_ids: List[int] = field(default_factory=lambda: [0, 14])
     seed: int = 0
@@ -185,7 +191,7 @@ class NgramHashMapping(nn.Module):
 
         # Determine prime hash-table size per N-gram order
         self.primes: List[int] = [
-            self._DEFAULT_PRIMES.get(k, self._DEFAULT_PRIMES[3])
+            config.n_embed_per_ngram
             for k in range(2, config.max_ngram_size + 1)
         ]
 
@@ -378,29 +384,29 @@ class EngramModule(nn.Module):
         total_rows = sum(self.ngram_hash.vocab_sizes)
 
         # --- Multi-head embedding ---
-        self.multi_head_emb = MultiHeadEmbedding(total_rows, config.n_embed_per_ngram)
+        self.multi_head_emb = MultiHeadEmbedding(total_rows, config.n_embed_dim)
 
         # Number of hash heads total: (max_ngram_size - 1) * n_head_per_ngram
         num_total_heads = (config.max_ngram_size - 1) * config.n_head_per_ngram
 
         # --- Short convolution ---
-        # Operate on head-averaged embedding: [B, S, n_embed_per_ngram]
-        self.short_conv = ShortConv(channels=config.n_embed_per_ngram, kernel_size=4)
+        # Operate on head-averaged embedding: [B, S, n_embed_dim]
+        self.short_conv = ShortConv(channels=config.n_embed_dim, kernel_size=4)
 
         # --- Head aggregation projection ---
         # Collapse total_heads dimension to a single embedding vector
         self.head_proj = nn.Linear(
-            num_total_heads * config.n_embed_per_ngram,
-            config.n_embed_per_ngram,
+            num_total_heads * config.n_embed_dim,
+            config.n_embed_dim,
             bias=False,
         )
 
         # --- Context-aware gating (attention-like) ---
-        # gate_proj: hidden_states → gate weights  (D → n_embed)
-        self.gate_proj = nn.Linear(hidden_size, config.n_embed_per_ngram, bias=False)
+        # gate_proj: hidden_states → gate weights  (D → n_embed_dim)
+        self.gate_proj = nn.Linear(hidden_size, config.n_embed_dim, bias=False)
 
-        # --- Output projection: n_embed → hidden_size ---
-        self.out_proj = nn.Linear(config.n_embed_per_ngram, hidden_size, bias=False)
+        # --- Output projection: n_embed_dim → hidden_size ---
+        self.out_proj = nn.Linear(config.n_embed_dim, hidden_size, bias=False)
         nn.init.zeros_(self.out_proj.weight)  # zero-init: Engram starts as identity
 
     def forward(self, input_ids: Tensor, hidden_states: Tensor) -> Tensor:
