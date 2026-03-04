@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import torch
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -151,10 +153,13 @@ class DistributedDataParallelConfig:
     fsdp_manual_registration: bool = False
     """If true, manually register the FSDP communication buffers to NCCL user buffer.
       This option is only effective when use_megatron_fsdp and nccl_ub is set.
-      For symmetric registration with large models, the registration itself can take 
+      For symmetric registration with large models, the registration itself can take
       a significant amount of time. This option minimizes the number of registration calls
       to minimize the registration time.
     """
+
+    main_params_dtype: torch.dtype = torch.float32
+    """dtype for the main weight buffer in FSDP. Set to torch.bfloat16 to save memory."""
 
     def __post_init__(self):
         import os
