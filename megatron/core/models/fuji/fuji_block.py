@@ -35,6 +35,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from megatron.core import parallel_state
 from megatron.core.models.engram.engram_module import EngramConfig, EngramModule
 from megatron.core.models.fuji.mhc_transformer_layer import MHCTransformerLayer
 from megatron.core.models.fuji.fuji_hybrid_decoder_layer import FujiLinearAttentionDecoderLayer
@@ -199,6 +200,35 @@ class FujiBlock(TransformerBlock):
                     layer_id=layer_idx,
                     hidden_size=config.hidden_size,
                 )
+
+    # ------------------------------------------------------------------
+    # Distributed checkpointing
+    # ------------------------------------------------------------------
+
+    def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None):
+        """Override to give stream_proj a PP-rank-qualified key.
+
+        stream_proj exists independently on every PP stage (each stage expands
+        and collapses mHC streams on its own).  Without this override, the
+        parent's sharded_state_dict emits the same key
+        ``decoder.stream_proj.weight`` on every stage with
+        ``replica_id=(0, 0, 0)``, which fails distributed-checkpoint
+        sharding validation.  We rename it to
+        ``decoder.stream_proj_ppN.weight`` so each stage has a unique key.
+        """
+        sharded_sd = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+        if self.stream_proj is not None:
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+            old_dict_key = f'{prefix}stream_proj.weight'
+            new_dict_key = f'{prefix}stream_proj_pp{pp_rank}.weight'
+            if old_dict_key in sharded_sd:
+                st = sharded_sd.pop(old_dict_key)
+                # ShardedTensor.key must also be updated to match the dict key.
+                st.key = new_dict_key
+                sharded_sd[new_dict_key] = st
+
+        return sharded_sd
 
     # ------------------------------------------------------------------
     # Forward

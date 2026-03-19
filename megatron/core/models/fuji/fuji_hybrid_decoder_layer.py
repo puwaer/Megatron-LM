@@ -31,6 +31,7 @@ from megatron.core.models.fuji.fuji_gated_delta_net import (
 from megatron.core.models.fuji.fuji_moe import FujiDenseMLP, FujiSparseMoE
 from megatron.core.transformer.mhc import ManifoldConstrainedHyperConnection
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -78,8 +79,12 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
         **kwargs,
     ) -> None:
         super().__init__(config)
-        self.layer_number = layer_number        # 1-indexed (Megatron convention)
-        self.layer_idx = layer_number - 1       # 0-indexed (used for cache)
+        # Store GLOBAL layer number to match TransformerLayer convention.
+        # Required for correct distributed checkpoint key generation in PP training.
+        vp_stage = kwargs.get('vp_stage', None)
+        pp_offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+        self.layer_number = layer_number + pp_offset  # GLOBAL 1-indexed (Megatron convention)
+        self.layer_idx = layer_number - 1             # LOCAL 0-indexed (used for GatedDeltaNet cache)
 
         D = config.hidden_size
         eps = getattr(config, 'layernorm_epsilon', 1e-6)
