@@ -22,7 +22,7 @@ from megatron.training import (
     pretrain
 )
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.utils import get_batch_on_this_tp_rank
+from megatron.training.utils import get_batch_on_this_tp_rank, is_first_or_last_pipeline_stage
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.utils import StragglerDetector
@@ -127,7 +127,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         GPTDataset,
         train_val_test_num_samples,
-        lambda: parallel_state.is_pipeline_last_stage(),
+        lambda: is_first_or_last_pipeline_stage(None) and parallel_state.get_tensor_model_parallel_rank() == 0,
         gpt_config
     ).build()
 
@@ -152,6 +152,9 @@ def forward_step(data_iterator, model):
 
 def get_batch(data_iterator):
     """Generate a batch"""
+    if data_iterator is None:
+        # Middle pipeline stages receive hidden states via P2P; they don't read data.
+        return None, None, None, None, None
     batch = get_batch_on_this_tp_rank(data_iterator)
     return (
         batch['tokens'],

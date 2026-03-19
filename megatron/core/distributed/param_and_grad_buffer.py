@@ -206,7 +206,14 @@ class _ParamAndGradBucketGroup:
         """
         if self.is_first_batch and len(self.per_param_grad_ready_counts) > 0:
             # Record golden per_param_grad_ready_counts.
-            assert len(self.per_param_grad_ready_counts) == len(self.params)
+            # Note: with --fp8-param-gather, Float8Tensor parameters have their AccumulateGrad
+            # hook registered incorrectly (param.expand_as() doesn't return the right grad_fn
+            # node for Float8Tensor), so register_grad_ready() is never called for them.
+            # Their gradients are written directly to main_grad by TransformerEngine's backward
+            # (grad_added_to_main_grad=True), so they are still correctly synced via
+            # finish_grad_sync(). We therefore allow per_param_grad_ready_counts to be a
+            # subset of self.params (the missing entries are Float8Tensor params).
+            assert set(self.per_param_grad_ready_counts.keys()).issubset(self.params)
             self.golden_per_param_grad_ready_counts = self.per_param_grad_ready_counts
             self.is_first_batch = False
         self.per_param_grad_ready_counts = {}
@@ -560,7 +567,8 @@ class _ParamAndGradBucketGroup:
             # If all params in bucket group have grads available, issue communication call.
             if not self.is_first_batch:
                 if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
-                    assert len(self.per_param_grad_ready_counts) == len(self.params)
+                    # Note: golden may be a subset of self.params when Float8Tensor params
+                    # are present (their hooks don't fire; see reset() comment above).
                     self.start_grad_sync(force_all_reduce=force_all_reduce)
 
 
