@@ -60,6 +60,11 @@ except ImportError:
     _TRITON_AVAILABLE = False
 
 
+def _next_pow2(n: int) -> int:
+    """Return the smallest power of 2 that is >= n."""
+    return 1 << (n - 1).bit_length() if n > 0 else 1
+
+
 # ---------------------------------------------------------------------------
 # Pure-PyTorch reference implementation (fallback + backward)
 # ---------------------------------------------------------------------------
@@ -98,18 +103,19 @@ def _pytorch_width_connection(
     wc = normed @ W_alpha                              # [T, n+n_perms]
     alpha_pre = torch.sigmoid(
         pre_branch_scale * wc[..., :n] + static_alpha[:n]
-    )                                                  # [T, n]
+    ).to(X_sb.dtype)                                   # [T, n]
+    
     res_coeff = torch.softmax(
         residual_scale * wc[..., n:] + static_alpha[n:], dim=-1
-    )                                                  # [T, n_perms]
+    ).to(X_sb.dtype)                                   # [T, n_perms]
 
-    H_res = torch.einsum('...r,rij->...ij', res_coeff, perms)   # [T, n, n]
+    H_res = torch.einsum('...r,rij->...ij', res_coeff, perms.to(X_sb.dtype))   # [T, n, n]
     new_residuals = torch.einsum('...ij,...jd->...id', H_res, X_sb)  # [T, n, D]
     branch_input = (alpha_pre.unsqueeze(-1) * X_sb).sum(dim=-2)      # [T, D]
 
     # Depth projection
     dc = normed @ W_beta                               # [T, n]
-    beta = torch.sigmoid(h_post_scale * dc + static_beta) * 2        # [T, n]
+    beta = (torch.sigmoid(h_post_scale * dc + static_beta) * 2.0).to(X_sb.dtype)        # [T, n]
 
     return branch_input, new_residuals, beta
 
@@ -132,9 +138,10 @@ if _TRITON_AVAILABLE:
         dc_ptr,           # [T, n_beta]
         # Dimensions (all constexpr for register-array unrolling)
         T,
-        nD: tl.constexpr,       # n * D
-        n_alpha: tl.constexpr,  # n + n_perms
-        n_beta: tl.constexpr,   # n
+        nD: tl.constexpr,           # n * D
+        n_alpha: tl.constexpr,      # n + n_perms  (actual count, e.g. 28)
+        n_beta: tl.constexpr,       # n
+        N_ALPHA_PAD: tl.constexpr,  # next pow2 >= n + N_PERMS_PAD  (e.g. 64)
         BLOCK_ND: tl.constexpr,
     ):
         """Pass 1: fused RMSNorm + linear projection for wc and dc.
@@ -151,7 +158,7 @@ if _TRITON_AVAILABLE:
         # rms_scale = rsqrt(mean(x^2) + eps) so that x * rms_scale = x / rms(x)
         # This gives F.normalize(x) * sqrt(nD), matching _RMSNorm.forward.
         sumsq = tl.zeros([1], dtype=tl.float32)
-        for _blk in tl.static_range(tl.cdiv(nD, BLOCK_ND)):
+        for _blk in range(tl.cdiv(nD, BLOCK_ND)):
             offs = _blk * BLOCK_ND + tl.arange(0, BLOCK_ND)
             mask = offs < nD
             x = tl.load(X_ptr + x_base + offs, mask=mask, other=0.0).to(tl.float32)
@@ -163,10 +170,10 @@ if _TRITON_AVAILABLE:
         # Load normed once per block, accumulate all n_alpha output columns.
         # acc_wc[col] accumulates the dot product for output column `col`.
         # Since n_alpha is constexpr, the loop is unrolled at compile time.
-        acc_wc = tl.zeros([n_alpha], dtype=tl.float32)
+        acc_wc = tl.zeros([N_ALPHA_PAD], dtype=tl.float32)
         acc_dc = tl.zeros([n_beta], dtype=tl.float32)
 
-        for _blk in tl.static_range(tl.cdiv(nD, BLOCK_ND)):
+        for _blk in range(tl.cdiv(nD, BLOCK_ND)):
             offs = _blk * BLOCK_ND + tl.arange(0, BLOCK_ND)
             mask = offs < nD
 
@@ -175,31 +182,28 @@ if _TRITON_AVAILABLE:
             g_chunk = tl.load(gamma_ptr + offs, mask=mask, other=0.0).to(tl.float32)
             normed_chunk = x_chunk * rms_scale * (g_chunk + 1.0)
 
-            # wc accumulation: loop over n_alpha output columns (compile-time unroll)
-            for col in tl.static_range(n_alpha):
-                # W_alpha is row-major [nD, n_alpha]: W_alpha[row, col] at row*n_alpha+col
-                w_col = tl.load(
-                    W_alpha_ptr + offs * n_alpha + col,
-                    mask=mask, other=0.0
-                ).to(tl.float32)
-                acc_wc[col] += tl.sum(normed_chunk * w_col)
+            # wc accumulation: 2D load [BLOCK_ND, N_ALPHA_PAD] → tl.sum(axis=0)
+            cols_wc = tl.arange(0, N_ALPHA_PAD)
+            w_ptrs = W_alpha_ptr + offs[:, None] * n_alpha + cols_wc[None, :]
+            w_mask = mask[:, None] & (cols_wc[None, :] < n_alpha)
+            w_chunk = tl.load(w_ptrs, mask=w_mask, other=0.0).to(tl.float32)
+            acc_wc += tl.sum(normed_chunk[:, None] * w_chunk, axis=0)
 
-            # dc accumulation: loop over n_beta output columns
-            for col in tl.static_range(n_beta):
-                w_col = tl.load(
-                    W_beta_ptr + offs * n_beta + col,
-                    mask=mask, other=0.0
-                ).to(tl.float32)
-                acc_dc[col] += tl.sum(normed_chunk * w_col)
+            # dc accumulation: 2D load [BLOCK_ND, n_beta] (n_beta=4, power-of-2)
+            cols_dc = tl.arange(0, n_beta)
+            w_ptrs_dc = W_beta_ptr + offs[:, None] * n_beta + cols_dc[None, :]
+            w_chunk_dc = tl.load(w_ptrs_dc, mask=mask[:, None], other=0.0).to(tl.float32)
+            acc_dc += tl.sum(normed_chunk[:, None] * w_chunk_dc, axis=0)
 
-        # Write wc and dc to scratch buffers (much smaller than normed)
-        wc_base = token_id * n_alpha
-        for col in tl.static_range(n_alpha):
-            tl.store(wc_ptr + wc_base + col, acc_wc[col])
-
+        # Vectorized stores (no scalar indexing)
+        wc_base = token_id * N_ALPHA_PAD
+        tl.store(
+            wc_ptr + wc_base + tl.arange(0, N_ALPHA_PAD),
+            acc_wc,
+            mask=tl.arange(0, N_ALPHA_PAD) < n_alpha,
+        )
         dc_base = token_id * n_beta
-        for col in tl.static_range(n_beta):
-            tl.store(dc_ptr + dc_base + col, acc_dc[col])
+        tl.store(dc_ptr + dc_base + tl.arange(0, n_beta), acc_dc)
 
     @triton.jit
     def _fused_mhc_output_kernel(
@@ -219,11 +223,13 @@ if _TRITON_AVAILABLE:
         beta_ptr,           # [T, n]
         # Dimensions
         T,
-        n: tl.constexpr,        # number of streams (must be 4)
+        n: tl.constexpr,            # number of streams (must be 4)
         D: tl.constexpr,
-        n_alpha: tl.constexpr,  # n + n_perms
-        n_perms: tl.constexpr,  # n! = 24 for n=4
-        n_beta: tl.constexpr,   # n
+        n_alpha: tl.constexpr,      # n + n_perms  (actual, e.g. 28)
+        n_perms: tl.constexpr,      # n! = 24 for n=4
+        n_beta: tl.constexpr,       # n
+        N_ALPHA_PAD: tl.constexpr,  # next pow2 >= n + N_PERMS_PAD  (e.g. 64)
+        N_PERMS_PAD: tl.constexpr,  # next pow2 >= n_perms  (e.g. 32)
         BLOCK_D: tl.constexpr,
     ):
         """Pass 2: compute alpha_pre, H_res (in registers), new_residuals, branch_input, beta."""
@@ -231,26 +237,45 @@ if _TRITON_AVAILABLE:
         if token_id >= T:
             return
 
-        # ---- Load wc and dc from scratch (small: 28 + 4 elements) ----
-        wc = tl.load(wc_ptr + token_id * n_alpha + tl.arange(0, n_alpha)).to(tl.float32)
+        # ---- Load wc in two parts (slice notation unsupported in this Triton version) ----
+        wc_base = token_id * N_ALPHA_PAD
+        wc_pre = tl.load(wc_ptr + wc_base + tl.arange(0, n)).to(tl.float32)               # [n]
+        wc_res = tl.load(wc_ptr + wc_base + n + tl.arange(0, N_PERMS_PAD)).to(tl.float32) # [N_PERMS_PAD]
         dc = tl.load(dc_ptr + token_id * n_beta + tl.arange(0, n_beta)).to(tl.float32)
 
-        # ---- alpha_pre [n] = sigmoid(scale * wc[:n] + static_alpha[:n]) ----
+        # ---- alpha_pre [n] = sigmoid(scale * wc_pre + static_alpha[:n]) ----
         sa_pre = tl.load(static_alpha_ptr + tl.arange(0, n)).to(tl.float32)
-        alpha_pre = tl.sigmoid(pre_branch_scale * wc[:n] + sa_pre)    # [n]
+        alpha_pre = tl.sigmoid(pre_branch_scale * wc_pre + sa_pre)                         # [n]
 
-        # ---- res_coeff [n_perms] = softmax(scale * wc[n:] + static_alpha[n:]) ----
-        sa_res = tl.load(static_alpha_ptr + n + tl.arange(0, n_perms)).to(tl.float32)
-        logits = residual_scale * wc[n:] + sa_res                      # [n_perms]
+        # ---- res_coeff [N_PERMS_PAD] = softmax(scale * wc_res + static_alpha[n:]) ----
+        # sa_res: padded to N_PERMS_PAD; elements >= n_perms are 0
+        sa_res = tl.load(
+            static_alpha_ptr + n + tl.arange(0, N_PERMS_PAD),
+            mask=tl.arange(0, N_PERMS_PAD) < n_perms, other=0.0,
+        ).to(tl.float32)
+        logits = residual_scale * wc_res + sa_res                                           # [N_PERMS_PAD]
+        # Mask padded positions to large negative value so softmax gives them zero weight
+        logits = tl.where(tl.arange(0, N_PERMS_PAD) < n_perms, logits, -1e9)
         logits = logits - tl.max(logits, axis=0)                       # numeric stability
         exp_l = tl.exp(logits)
-        res_coeff = exp_l / tl.sum(exp_l)                              # [n_perms]
+        res_coeff = exp_l / tl.sum(exp_l)                              # [N_PERMS_PAD]
 
-        # ---- H_res [n*n] = Σ_r res_coeff[r] * P_r  (kept in registers) ----
-        H_res = tl.zeros([n * n], dtype=tl.float32)
-        for r in tl.static_range(n_perms):
-            perm_r = tl.load(perms_ptr + r * n * n + tl.arange(0, n * n)).to(tl.float32)
-            H_res = H_res + res_coeff[r] * perm_r
+        # ---- Precompute h_rows: one [n] weight-vector per output stream ----
+        # Tritonのリスト制約を回避するため、n=4 を前提に手動でアンロールして展開
+        rows_p = tl.arange(0, N_PERMS_PAD)
+        cols_n = tl.arange(0, n)
+        
+        p0 = tl.load(perms_ptr + rows_p[:, None] * (n * n) + 0 * n + cols_n[None, :], mask=rows_p[:, None] < n_perms, other=0.0).to(tl.float32)
+        h_row_0 = tl.sum(res_coeff[:, None] * p0, axis=0)
+        
+        p1 = tl.load(perms_ptr + rows_p[:, None] * (n * n) + 1 * n + cols_n[None, :], mask=rows_p[:, None] < n_perms, other=0.0).to(tl.float32)
+        h_row_1 = tl.sum(res_coeff[:, None] * p1, axis=0)
+        
+        p2 = tl.load(perms_ptr + rows_p[:, None] * (n * n) + 2 * n + cols_n[None, :], mask=rows_p[:, None] < n_perms, other=0.0).to(tl.float32)
+        h_row_2 = tl.sum(res_coeff[:, None] * p2, axis=0)
+        
+        p3 = tl.load(perms_ptr + rows_p[:, None] * (n * n) + 3 * n + cols_n[None, :], mask=rows_p[:, None] < n_perms, other=0.0).to(tl.float32)
+        h_row_3 = tl.sum(res_coeff[:, None] * p3, axis=0)
 
         # ---- beta [n] = sigmoid(scale * dc + static_beta) * 2 ----
         sb = tl.load(static_beta_ptr + tl.arange(0, n_beta)).to(tl.float32)
@@ -261,31 +286,34 @@ if _TRITON_AVAILABLE:
         # ---- Process D in blocks: compute new_residuals and branch_input ----
         # X layout: [T, n, D] with n=4; X[token, s, d] at token*n*D + s*D + d
         x_base = token_id * n * D
+        n_idx = tl.arange(0, n)
 
-        for d_blk in tl.static_range(tl.cdiv(D, BLOCK_D)):
+        for d_blk in range(tl.cdiv(D, BLOCK_D)):
             d_offs = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
             d_mask = d_offs < D
 
-            # Load the four streams for this D block (n=4, hard-coded for unrolling)
-            x0 = tl.load(X_ptr + x_base + 0 * D + d_offs, mask=d_mask, other=0.0).to(tl.float32)
-            x1 = tl.load(X_ptr + x_base + 1 * D + d_offs, mask=d_mask, other=0.0).to(tl.float32)
-            x2 = tl.load(X_ptr + x_base + 2 * D + d_offs, mask=d_mask, other=0.0).to(tl.float32)
-            x3 = tl.load(X_ptr + x_base + 3 * D + d_offs, mask=d_mask, other=0.0).to(tl.float32)
+            # 2D load all n streams at once: x_chunk [n, BLOCK_D]
+            x_ptrs = X_ptr + x_base + n_idx[:, None] * D + d_offs[None, :]
+            x_chunk = tl.load(x_ptrs, mask=d_mask[None, :], other=0.0).to(tl.float32)
 
             # branch_input[d] = Σ_s alpha_pre[s] * x_s[d]
-            bi = alpha_pre[0] * x0 + alpha_pre[1] * x1 + alpha_pre[2] * x2 + alpha_pre[3] * x3
+            bi = tl.sum(alpha_pre[:, None] * x_chunk, axis=0)           # [BLOCK_D]
             tl.store(branch_input_ptr + token_id * D + d_offs,
                      bi.to(tl.bfloat16), mask=d_mask)
 
-            # new_residuals[i, d] = Σ_j H_res[i*n+j] * x_j[d]
-            x_streams = (x0, x1, x2, x3)
-            for i in tl.static_range(n):
-                nr_i = (H_res[i * n + 0] * x_streams[0]
-                        + H_res[i * n + 1] * x_streams[1]
-                        + H_res[i * n + 2] * x_streams[2]
-                        + H_res[i * n + 3] * x_streams[3])
-                tl.store(new_residuals_ptr + token_id * n * D + i * D + d_offs,
-                         nr_i.to(tl.bfloat16), mask=d_mask)
+            # new_residuals[i, d] = Σ_j h_rows_i[j] * x_chunk[j, d]
+            # こちらもリストを使わず個別のテンソルで計算
+            nr_0 = tl.sum(h_row_0[:, None] * x_chunk, axis=0)
+            nr_1 = tl.sum(h_row_1[:, None] * x_chunk, axis=0)
+            nr_2 = tl.sum(h_row_2[:, None] * x_chunk, axis=0)
+            nr_3 = tl.sum(h_row_3[:, None] * x_chunk, axis=0)
+
+            # メモリへの書き込み
+            out_ptr_base = new_residuals_ptr + token_id * n * D + d_offs
+            tl.store(out_ptr_base + 0 * D, nr_0.to(tl.bfloat16), mask=d_mask)
+            tl.store(out_ptr_base + 1 * D, nr_1.to(tl.bfloat16), mask=d_mask)
+            tl.store(out_ptr_base + 2 * D, nr_2.to(tl.bfloat16), mask=d_mask)
+            tl.store(out_ptr_base + 3 * D, nr_3.to(tl.bfloat16), mask=d_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -319,11 +347,13 @@ if _TRITON_AVAILABLE:
             nD = n * D
             n_alpha = n + n_perms
             n_beta = n
+            N_PERMS_PAD = _next_pow2(n_perms)           # 24 → 32
+            N_ALPHA_PAD = _next_pow2(n + N_PERMS_PAD)   # 36 → 64
             BLOCK_ND = min(128, nD)
             BLOCK_D = min(128, D)
 
-            # Scratch buffers: wc [T, n_alpha], dc [T, n]  (float32 for precision)
-            wc_scratch = torch.empty((T, n_alpha), dtype=torch.float32, device=device)
+            # Scratch buffers: wc uses padded size; zeros() ensures padding elements are 0
+            wc_scratch = torch.zeros((T, N_ALPHA_PAD), dtype=torch.float32, device=device)
             dc_scratch = torch.empty((T, n_beta), dtype=torch.float32, device=device)
 
             # Output tensors
@@ -339,6 +369,7 @@ if _TRITON_AVAILABLE:
                 X_flat_nd, W_alpha, W_beta, gamma,
                 wc_scratch, dc_scratch,
                 T=T, nD=nD, n_alpha=n_alpha, n_beta=n_beta,
+                N_ALPHA_PAD=N_ALPHA_PAD,
                 BLOCK_ND=BLOCK_ND,
             )
 
@@ -353,6 +384,7 @@ if _TRITON_AVAILABLE:
                 h_post_scale.item(),
                 branch_input, new_residuals, beta_out,
                 T=T, n=n, D=D, n_alpha=n_alpha, n_perms=n_perms, n_beta=n_beta,
+                N_ALPHA_PAD=N_ALPHA_PAD, N_PERMS_PAD=N_PERMS_PAD,
                 BLOCK_D=BLOCK_D,
             )
 
