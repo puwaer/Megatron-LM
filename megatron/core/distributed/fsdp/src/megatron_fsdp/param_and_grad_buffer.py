@@ -326,10 +326,18 @@ def build_data_parallel_buffer_index(
 
     # For all bucket parameters, add information on the parameter to the item index map,
     # and add the size of the parameter to the bucket.
+    # FP8 GEMM (CUTLASS) requires tensors to start at 16-element (=16-byte for FP8,
+    # 32-byte for BF16) boundaries.  Without explicit alignment, Megatron-FSDP packs
+    # parameters consecutively with no guarantee, which causes
+    # "CUDA error: misaligned address" when --fp8-param-gather is used together
+    # with --use-megatron-fsdp.
+    _GEMM_ALIGN = 16  # elements; covers FP8 (1 B/elem) and BF16 (2 B/elem)
+
     item_index_map = {}
     data_index = 0
     while len(regular_items) > 0:
         item_id, item = regular_items.pop(0)
+        data_index = _pad(data_index, _GEMM_ALIGN)  # ensure 16-element alignment
         add_item(item_id, item, data_index, item_index_map)
         if item.numel() % chunk_size_factor == 0:
             data_index += item.numel()
@@ -368,6 +376,7 @@ def build_data_parallel_buffer_index(
             fragment_items.remove(id_frag)
 
     for frag_id, frag in fragment_items:
+        data_index = _pad(data_index, _GEMM_ALIGN)  # ensure 16-element alignment
         add_item(frag_id, frag, data_index, item_index_map)
         data_index += frag.numel()
 
@@ -1618,6 +1627,9 @@ class ParamAndGradBuffer:
         )
         self.ubr_groups = None
         self.already_registered = False
+        self.use_precision_aware_optimizer = getattr(
+            self.ddp_config, 'use_precision_aware_optimizer', False
+        )
         # User buffer registration related settings
         if self.ddp_config.nccl_ub:
             assert nccl_allocator is not None, (
@@ -2049,7 +2061,7 @@ class ParamAndGradBuffer:
                     group.params,
                     is_data_distributed=is_main_weight_buffer_distributed
                     and main_buf_dp_group.size() > 1,
-                    dtype=torch.float32,
+                    dtype=getattr(self.ddp_config, 'main_params_dtype', torch.float32),
                     device=self.device,
                     data_parallel_group=main_buf_dp_group,
                     bucket_id=group_id,

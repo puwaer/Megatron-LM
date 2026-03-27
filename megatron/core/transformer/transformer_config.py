@@ -924,6 +924,97 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    ####################
+    # mHC (Manifold-Constrained Hyper-Connections)
+    ####################
+    use_mhc: bool = False
+    """Whether to use Manifold-Constrained Hyper-Connections (mHC) instead of standard residual
+    connections. mHC extends residual connections to n parallel streams and constrains the mixing
+    matrix to be doubly stochastic via Sinkhorn-Knopp projection. See arXiv:2512.24880."""
+
+    mhc_num_streams: int = 4
+    """Number of parallel residual streams for mHC. The paper uses 4 streams."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for projecting the residual mixing matrix H_res onto
+    the doubly stochastic manifold (Birkhoff polytope). 20 iterations typically suffice."""
+
+    mhc_selective_recompute: bool = False
+    """When True and training, use selective recomputation for mHC width/depth connections.
+    The forward pass discards new_residuals, beta, and all intermediate tensors
+    (H_res, normed, wc, res_coeff) from the autograd graph.  The backward pass
+    recomputes _width_connection on-the-fly from the saved X and x_out tensors.
+    Memory saving: ~8196·S·B elements per layer (n=4, D=2048)."""
+
+    mhc_auto_recompute_num_layers: bool = False
+    """When True and use_mhc=True, automatically set recompute_num_layers to the
+    theoretically optimal value L_r* = round(sqrt(n*L/(n+2))), which minimises
+    peak transient memory during the backward pass under uniform recompute.
+    For n=4, L=12 this gives L_r* = 3 (four blocks of three layers each)."""
+
+    mhc_use_fused_kernel: bool = False
+    """When True, use the fused Triton kernel for the mHC width connection forward
+    pass.  The kernel keeps normed, wc, H_res, and res_coeff in SRAM, avoiding
+    HBM round-trips for these intermediates.  Falls back to PyTorch when Triton
+    is unavailable, the device is CPU, or n != 4.  Requires bfloat16."""
+
+    mhc_async_pp_overlap: bool = False
+    """When True, run mHC width and depth connections on a dedicated high-priority
+    CUDA stream to enable overlap with pipeline-parallel (PP) P2P communication.
+
+    Overlap model (PP ≥ 2):
+      - NCCL P2P transfers (send_forward / recv_forward) occupy the DMA/copy engine.
+      - mHC SM kernels (width_connection, depth_connection) run on the SM compute engine.
+      - Both engines are independent hardware units and can execute concurrently.
+
+    Stream topology per MHCTransformerLayer:
+      _mhc_stream  (priority = -1, high): runs width_connection and depth_connection.
+      current_stream (priority =  0):     runs TransformerLayer (attn + MLP) and
+                                          PP NCCL send/recv operations.
+
+    Synchronisation barriers (CUDA event pairs):
+      _mhc_event_w: records after width_connection  → current_stream.wait_event
+      _mhc_event_d: records after depth_connection  → current_stream.wait_event
+
+    Net effect per layer call:
+      width_connection and Transformer compute are serialised (event barrier).
+      depth_connection and the SUBSEQUENT PP send DMA CAN overlap when the PP
+      schedule issues send_forward immediately after forward() returns — the
+      DMA engine starts while the SM is already running the next recv or compute.
+
+    Prerequisites: PP ≥ 2, CUDA device, use_mhc = True.
+    Overhead when PP = 1: two stream-wait + two event-record per layer (< 1 μs)."""
+
+    ####################
+    # Engram (Conditional Memory via Scalable Lookup)
+    ####################
+    use_engram: bool = False
+    """Whether to use Engram conditional memory modules. Engram provides a second axis of sparsity
+    via deterministic N-gram hash-based memory lookup. See arXiv:2601.07372."""
+
+    engram_layer_ids: Optional[List[int]] = None
+    """List of 0-indexed layer IDs where Engram modules are inserted (e.g. [0, 14] for layers 1
+    and 15). If None and use_engram=True, defaults to [0, num_layers // 2]."""
+
+    engram_max_ngram_size: int = 3
+    """Maximum N-gram size for Engram memory lookup (supports 2-gram up to this size)."""
+
+    engram_n_embed_per_ngram: int = 99991
+    """Hash table size (prime) per N-gram order. Replaces the hard-coded _DEFAULT_PRIMES
+    in NgramHashMapping. Should be a prime number (e.g. 99991)."""
+
+    engram_embed_dim: int = 672
+    """Embedding dimension per entry in the Engram multi-head embedding table."""
+
+    engram_n_head_per_ngram: int = 8
+    """Number of hash heads per N-gram for collision resistance in Engram."""
+
+    engram_seed: int = 0
+    """Random seed for Engram hash multiplier generation (deterministic hashing)."""
+
+    engram_base_vocab_size: int = 129280
+    """Base vocabulary size used by the tokenizer (default: DeepSeek-V3 tokenizer size)."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
