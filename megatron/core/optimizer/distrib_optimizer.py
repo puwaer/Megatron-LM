@@ -601,7 +601,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
-                params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
+                params=[g["orig_group"] for g in self.opt_group_ranges],
+                data_parallel_group=self.data_parallel_group,
+                **self.optimizer.defaults,
             )
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
@@ -2383,7 +2385,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     if is_float8tensor(model_param):
                         param_range_map = self._get_model_param_range_map(model_param)
                         param_range = param_range_map["param"]
-                        assert param_range.size == shard_main_param.nelement()
+                        # shard_main_param is None when use_precision_aware_optimizer
+                        # is True (main params held by the optimizer, e.g. HDO).
+                        if shard_main_param is not None:
+                            assert param_range.size == shard_main_param.nelement()
                         idx = fp8_param_to_idx_map[model_param]
                         shard_fp32_from_fp8[idx] = shard_main_param
                         shard_offsets_in_fp8[idx] = param_range.start
@@ -2392,6 +2397,52 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         get_shard_fp32_from_fp8(self.shard_fp32_groups, self.model_fp32_groups)
 
         return fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
+
+    def _quantize_fp8_from_hdo_masters(self):
+        """Quantize updated HDO bf16 masters back to FP8 model param buffers.
+
+        Called from _copy_main_params_to_model_params when CPU offload is active.
+        Uses the full fp8_params list (same across all DP ranks) so that the
+        all_reduce inside quantize_param_shard has a consistent element count.
+
+        HDO stores bf16 masters keyed by the FP8 shard-view tensors
+        (model_param.view(-1)[start:end]).  We match those to the full model
+        params via shard_float16_groups / model_float16_groups.
+        """
+        fp8_params, _, offsets = self._get_fp8_params_and_shard_fp32_from_fp8()
+        if not fp8_params:
+            return
+
+        hdo = self.optimizer
+
+        # Build: full FP8 model param → shard view (same object HDO received as orig_param)
+        fp8_id_to_shard_view = {}
+        for shard_group, model_group in zip(
+            self.shard_float16_groups, self.model_float16_groups
+        ):
+            for shard_view, model_param in zip(shard_group, model_group):
+                if is_float8tensor(model_param) and shard_view is not None:
+                    fp8_id_to_shard_view[id(model_param)] = shard_view
+
+        # Replace None shard_mains with HDO's updated bf16 masters (moved to GPU).
+        shard_mains = []
+        for fp8_param, offset in zip(fp8_params, offsets):
+            if offset is None:
+                # This DP rank holds no shard of this param.
+                shard_mains.append(None)
+                continue
+            shard_view = fp8_id_to_shard_view.get(id(fp8_param))
+            master = None
+            if shard_view is not None:
+                master = hdo.param_to_fp32_param.get(shard_view)
+            if master is not None:
+                if not master.is_cuda:
+                    master = master.to(fp8_param.device)   # blocking H2D
+                shard_mains.append(master)
+            else:
+                shard_mains.append(None)
+
+        quantize_param_shard(fp8_params, shard_mains, offsets, self.data_parallel_group)
 
     def _copy_model_grads_to_main_grads(self):
         """
@@ -2455,6 +2506,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            # For CPU-offload (HybridDeviceOptimizer), FP8 params are NOT quantized by the
+            # optimizer's copy-back hooks (to avoid per-rank all_reduce count mismatch).
+            # Handle them here where all DP ranks use the same full fp8_params list.
+            if isinstance(self.optimizer, HybridDeviceOptimizer):
+                self._quantize_fp8_from_hdo_masters()
             return
 
         quantize_param_shard(
