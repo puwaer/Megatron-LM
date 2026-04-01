@@ -2286,6 +2286,10 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
+    # Release cached CUDA memory that may remain after distributed checkpoint
+    # saving (e.g. temporary tensors from all_gather_object in fully_parallel
+    # checkpoint strategy).
+    torch.cuda.empty_cache()
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
 
