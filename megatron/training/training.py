@@ -2264,6 +2264,9 @@ def save_checkpoint_and_time(
     if should_report_memory:
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
+    # Release cached CUDA memory before checkpoint save to prevent OOM during
+    # NCCL all_gather_object in FullyParallelSaveStrategyWrapper.
+    torch.cuda.empty_cache()
     # Save checkpoint.
     save_checkpoint(
         iteration,
