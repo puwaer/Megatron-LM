@@ -2264,6 +2264,9 @@ def save_checkpoint_and_time(
     if should_report_memory:
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
+    # Release cached CUDA memory before checkpoint save to prevent OOM during
+    # NCCL all_gather_object in FullyParallelSaveStrategyWrapper.
+    torch.cuda.empty_cache()
     # Save checkpoint.
     save_checkpoint(
         iteration,
@@ -2286,6 +2289,10 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
+    # Release cached CUDA memory that may remain after distributed checkpoint
+    # saving (e.g. temporary tensors from all_gather_object in fully_parallel
+    # checkpoint strategy).
+    torch.cuda.empty_cache()
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
 

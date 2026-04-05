@@ -236,7 +236,10 @@ if HAVE_TE and is_te_min_version("2.2"):
         start_offsets: List[int],
         data_parallel_group: torch.distributed.ProcessGroup,
         fsdp_shard_model_params: Optional[List[torch.Tensor]] = None,
+        sync_amaxes: bool = True,
     ) -> None:
+        # sync_amaxes is accepted for API compatibility; amax reduction is
+        # handled internally by cast_master_weights_to_fp8 in TE 2.2+.
         if len(model_params) == 0:
             return
 
@@ -287,6 +290,7 @@ elif HAVE_TE and is_te_min_version("2.0"):
         start_offsets: List[int],
         data_parallel_group: torch.distributed.ProcessGroup,
         fsdp_shard_model_params: Optional[List[torch.Tensor]] = None,
+        sync_amaxes: bool = True,
     ) -> None:
         # Avoid circular import
         from megatron.core.optimizer.optimizer import _multi_tensor_copy_this_to_that
@@ -346,14 +350,15 @@ elif HAVE_TE and is_te_min_version("2.0"):
         torch.reciprocal(packed_scales, out=packed_scales)
         _multi_tensor_copy_this_to_that(packed_scale_views, scale_invs, dummy_overflow_buf)
 
-        # Reduce amaxes.
+        # Reduce amaxes across data-parallel ranks.
         # Note: Assume each param has a separate amax.
         packed_amaxes = torch.empty(len(amaxes), dtype=torch.float32, device=amaxes[0].device)
         packed_amax_views = [packed_amaxes[i].view(1) for i in range(len(amaxes))]
         _multi_tensor_copy_this_to_that(amaxes, packed_amax_views, dummy_overflow_buf)
-        torch.distributed.all_reduce(
-            packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
-        )
+        if sync_amaxes:
+            torch.distributed.all_reduce(
+                packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
+            )
         _multi_tensor_copy_this_to_that(packed_amax_views, amaxes, dummy_overflow_buf)
 
     def _correct_amax_history_if_needed_impl(model: List[torch.nn.Module]) -> None:
@@ -377,6 +382,7 @@ elif HAVE_TE and is_te_min_version("1.0"):
         start_offsets: List[int],
         data_parallel_group: torch.distributed.ProcessGroup,
         fsdp_shard_model_params: Optional[List[torch.Tensor]] = None,
+        sync_amaxes: bool = True,
     ) -> None:
         # Avoid circular import
         from megatron.core.optimizer.optimizer import _multi_tensor_copy_this_to_that
@@ -433,14 +439,15 @@ elif HAVE_TE and is_te_min_version("1.0"):
         torch.reciprocal(packed_scales, out=packed_scales)
         _multi_tensor_copy_this_to_that(packed_scale_views, scale_invs, dummy_overflow_buf)
 
-        # Reduce amaxes.
+        # Reduce amaxes across data-parallel ranks.
         # Note: Assume each param has a separate amax.
         packed_amaxes = torch.empty(len(amaxes), dtype=torch.float32, device=amaxes[0].device)
         packed_amax_views = [packed_amaxes[i].view(1) for i in range(len(amaxes))]
         _multi_tensor_copy_this_to_that(amaxes, packed_amax_views, dummy_overflow_buf)
-        torch.distributed.all_reduce(
-            packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
-        )
+        if sync_amaxes:
+            torch.distributed.all_reduce(
+                packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
+            )
         _multi_tensor_copy_this_to_that(packed_amax_views, amaxes, dummy_overflow_buf)
 
     def _correct_amax_history_if_needed_impl(model: List[torch.nn.Module]) -> None:
@@ -482,11 +489,22 @@ def modify_underlying_storage(tensor: torch.Tensor, new_raw_data: torch.Tensor):
 
 # Interface Function
 def quantize_param_shard(
-    model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
+    model_params,
+    main_params,
+    start_offsets,
+    data_parallel_group,
+    fsdp_shard_model_params=None,
+    sync_amaxes: bool = True,
 ):
-    """Cast shard fp32 main params to fp8 model params."""
+    """Cast shard fp32/bf16 main params to fp8 model params.
+
+    sync_amaxes: when False, skip the data-parallel all_reduce of amax values.
+    Useful for pipelining: do per-param local quantization first, then call once
+    with sync_amaxes=True at the end of the optimizer step.
+    """
     _quantize_param_shard_impl(
-        model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
+        model_params, main_params, start_offsets, data_parallel_group,
+        fsdp_shard_model_params, sync_amaxes=sync_amaxes,
     )
 
 
