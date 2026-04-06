@@ -8,21 +8,59 @@ Design (from Qwen3-Next):
       routed_experts  — top-k selected from num_experts candidates
   - Both expert types use a SwiGLU MLP.
 
-Megatron-LM tensor convention: [S, B, D] (sequence-first).
-Internally the module reshapes to [S*B, D] for expert computation then back.
-
-Note: This implementation is intended for correctness and research iteration.
-      For high-throughput production use, the standard Megatron MoE
-      (SwitchMLP / GroupedMLP) with proper expert parallelism should be
-      integrated.  That integration is left as future work.
+Expert Parallelism (EP):
+  - FujiRoutedExperts shards experts across EP ranks.
+  - Each GPU holds num_experts / EP local experts.
+  - EP > 1: tokens are dispatched via all-to-all before expert compute and
+    gathered back via all-to-all after. Routing weights are applied inside
+    the expert compute step.
+  - Expert compute uses GroupedGEMM when available (grouped_gemm package),
+    falling back to a Python loop otherwise.
+  - Checkpoint loading: when the saved checkpoint contains all num_experts
+    (e.g. trained with EP=1), _load_from_state_dict automatically slices the
+    correct shard for the current EP rank.
 """
 
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+
+try:
+    from megatron.core import parallel_state as _parallel_state
+    _HAVE_PARALLEL_STATE = True
+except ImportError:
+    _HAVE_PARALLEL_STATE = False
+
+try:
+    from megatron.core.transformer.moe import grouped_gemm_util as gg
+    _HAVE_GROUPED_GEMM = gg.grouped_gemm_is_available()
+except Exception:
+    gg = None
+    _HAVE_GROUPED_GEMM = False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _get_ep_info():
+    """Return (ep_size, ep_rank, ep_group) from parallel_state, or (1, 0, None)."""
+    if not _HAVE_PARALLEL_STATE:
+        return 1, 0, None
+    try:
+        ep_size = _parallel_state.get_expert_model_parallel_world_size()
+        ep_rank = _parallel_state.get_expert_model_parallel_rank()
+        ep_group = _parallel_state.get_expert_model_parallel_group()
+        # world_size returns 0 when distributed is not initialised
+        if ep_size <= 0:
+            return 1, 0, None
+        return ep_size, ep_rank, ep_group
+    except Exception:
+        return 1, 0, None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -87,63 +125,371 @@ class FujiTopKRouter(nn.Module):
 
 
 class FujiRoutedExperts(nn.Module):
-    """Batched routed experts (num_experts × SwiGLU MLPs).
+    """EP-aware batched routed experts.
 
-    Parameters are stored as 3-D weight tensors for efficient per-expert lookup.
+    Each GPU holds ``num_local_experts = num_experts / EP`` experts.
+    When EP > 1, tokens are dispatched via all-to-all before expert computation
+    and gathered back after.  Expert computation uses GroupedGEMM when the
+    ``grouped_gemm`` package is available, otherwise falls back to a Python loop.
+
+    Weights (``gate_up_proj``, ``down_proj``) keep their original shapes so that
+    checkpoints produced without EP (all experts on one GPU) can be loaded
+    without conversion: ``_load_from_state_dict`` automatically slices the
+    correct shard.
 
     Args:
-        num_experts:       Total number of routed experts.
+        num_experts:       Total number of routed experts (global).
         hidden_size:       Model hidden dimension D.
         intermediate_size: Per-expert intermediate dimension.
     """
 
     def __init__(self, num_experts: int, hidden_size: int, intermediate_size: int) -> None:
         super().__init__()
+        ep_size, ep_rank, _ep_group = _get_ep_info()
+
+        assert num_experts % ep_size == 0, (
+            f"num_experts ({num_experts}) must be divisible by EP size ({ep_size})"
+        )
+
         self.num_experts = num_experts
+        self.intermediate_size = intermediate_size
+        self.hidden_size = hidden_size
+        self.num_local_experts = num_experts // ep_size
+        self.local_expert_offset = ep_rank * self.num_local_experts
+
+        # Only allocate local experts on this rank.
+        # Shapes kept identical to the original full-expert tensors (per expert),
+        # so existing checkpoint keys remain valid with shard-aware loading.
         self.gate_up_proj = nn.Parameter(
-            torch.empty(num_experts, 2 * intermediate_size, hidden_size)
+            torch.empty(self.num_local_experts, 2 * intermediate_size, hidden_size)
         )
         self.down_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_size, intermediate_size)
+            torch.empty(self.num_local_experts, hidden_size, intermediate_size)
         )
         nn.init.kaiming_uniform_(self.gate_up_proj.view(-1, hidden_size), a=5 ** 0.5)
         nn.init.kaiming_uniform_(self.down_proj.view(-1, intermediate_size), a=5 ** 0.5)
 
+        # Expert weights must NOT be all-reduced across DP when EP > 1.
+        # Megatron uses the `allreduce` attribute to decide this.
+        _expert_parallel = ep_size > 1
+        setattr(self.gate_up_proj, 'allreduce', not _expert_parallel)
+        setattr(self.down_proj,    'allreduce', not _expert_parallel)
+
+    # ------------------------------------------------------------------
+    # Checkpoint compatibility: load from full (EP=1) or sharded state
+    # ------------------------------------------------------------------
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Load local expert shard from a full (EP=1) or matching shard checkpoint.
+
+        If the saved tensor has shape ``[num_experts, ...]`` (full checkpoint),
+        we slice ``[local_expert_offset : local_expert_offset + num_local_experts]``.
+        If the saved tensor already has shape ``[num_local_experts, ...]``, we
+        load it directly.
+        """
+        for param_name in ('gate_up_proj', 'down_proj'):
+            key = prefix + param_name
+            if key not in state_dict:
+                if strict:
+                    missing_keys.append(key)
+                continue
+
+            saved = state_dict[key]
+            param = getattr(self, param_name)
+
+            if saved.shape == param.shape:
+                # Already the correct shard shape — load directly.
+                param.data.copy_(saved)
+            elif saved.shape[0] == self.num_experts:
+                # Full checkpoint (EP=1): slice the local shard.
+                shard = saved[
+                    self.local_expert_offset : self.local_expert_offset + self.num_local_experts
+                ]
+                if shard.shape != param.shape:
+                    error_msgs.append(
+                        f"Size mismatch for {key}: sliced shard {shard.shape} "
+                        f"!= parameter {param.shape}"
+                    )
+                else:
+                    param.data.copy_(shard)
+            else:
+                error_msgs.append(
+                    f"Cannot load {key}: saved shape {saved.shape} is incompatible "
+                    f"with num_local_experts={self.num_local_experts}, "
+                    f"num_experts={self.num_experts}."
+                )
+
+    # ------------------------------------------------------------------
+    # Internal: grouped-GEMM expert compute on locally-owned tokens
+    # ------------------------------------------------------------------
+
+    def _compute_local(
+        self,
+        tokens: Tensor,        # [N, D] — tokens sorted by local expert id
+        local_ids: Tensor,     # [N]   — local expert id in [0, num_local_experts)
+        weights: Tensor,       # [N]   — routing weight per token
+        tokens_per_expert: Tensor,  # [num_local_experts] int
+    ) -> Tensor:
+        """Compute expert outputs for the locally-owned experts.
+
+        Uses GroupedGEMM when available (much faster), otherwise falls back to
+        the original Python loop.
+
+        Returns:
+            [N, D]  — expert outputs with routing weights applied.
+        """
+        N = tokens.shape[0]
+        if N == 0:
+            return torch.zeros_like(tokens)
+
+        if _HAVE_GROUPED_GEMM:
+            return self._compute_local_grouped_gemm(tokens, tokens_per_expert, weights)
+        else:
+            return self._compute_local_loop(tokens, local_ids, weights)
+
+    def _compute_local_grouped_gemm(
+        self,
+        tokens: Tensor,             # [N, D]  sorted by local expert
+        tokens_per_expert: Tensor,  # [E_local] int
+        weights: Tensor,            # [N]
+    ) -> Tensor:
+        """GroupedGEMM path for local expert computation.
+
+        Weight convention (kept from original FujiRoutedExperts):
+          gate_up_proj: [E_local, 2*I, D]  → gmm with trans_b=True → [N, D] @ [D, 2I]
+          down_proj:    [E_local, D, I]    → gmm with trans_b=True → [N, I] @ [I, D]
+        """
+        # fc1: [N, D] @ gate_up_proj[e].T = [N, 2I]
+        fc1 = gg.ops.gmm(tokens, self.gate_up_proj, tokens_per_expert, trans_b=True)
+
+        # SwiGLU
+        gate, up = fc1.chunk(2, dim=-1)       # each [N, I]
+        h = F.silu(gate) * up                  # [N, I]
+
+        # Apply routing weights before down_proj (saves one pass)
+        h = h * weights.unsqueeze(-1)          # [N, I]
+
+        # fc2: [N, I] @ down_proj[e].T = [N, D]
+        out = gg.ops.gmm(h, self.down_proj, tokens_per_expert, trans_b=True)
+
+        return out
+
+    def _compute_local_loop(
+        self,
+        tokens: Tensor,    # [N, D]  sorted by local expert
+        local_ids: Tensor, # [N]
+        weights: Tensor,   # [N]
+    ) -> Tensor:
+        """Fallback Python-loop path (slow, but no extra dependency)."""
+        output = torch.zeros_like(tokens)
+
+        with torch.no_grad():
+            expert_mask = F.one_hot(local_ids, self.num_local_experts)  # [N, E_local]
+            expert_mask = expert_mask.T                                   # [E_local, N]
+            active = expert_mask.any(dim=1).nonzero(as_tuple=False)
+
+        for row in active:
+            eid = row[0].item()
+            tok_idx = torch.where(expert_mask[eid])[0]
+            x = tokens[tok_idx]
+            gate_out, up_out = F.linear(x, self.gate_up_proj[eid]).chunk(2, dim=-1)
+            x = F.silu(gate_out) * up_out
+            x = x * weights[tok_idx, None]
+            x = F.linear(x, self.down_proj[eid])
+            output.index_add_(0, tok_idx, x.to(output.dtype))
+
+        return output
+
+    # ------------------------------------------------------------------
+    # All-to-all dispatch helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _exchange_counts(
+        send_counts: Tensor,   # [EP] int64 on device
+        ep_group,
+    ) -> Tensor:
+        """All-to-all exchange of per-rank token counts. Returns recv_counts [EP]."""
+        recv_counts = torch.empty_like(send_counts)
+        dist.all_to_all_single(recv_counts, send_counts, group=ep_group)
+        return recv_counts
+
+    @staticmethod
+    def _all_to_all_tokens(
+        data: Tensor,           # [N_send, ...]
+        send_counts: Tensor,    # [EP] int
+        recv_counts: Tensor,    # [EP] int
+        ep_group,
+    ) -> Tensor:
+        """Send/receive variable-length token data across EP ranks."""
+        send_splits = send_counts.tolist()
+        recv_splits = recv_counts.tolist()
+        total_recv  = int(recv_counts.sum().item())
+        shape_rest  = data.shape[1:]
+        out = torch.empty(
+            (total_recv, *shape_rest), dtype=data.dtype, device=data.device
+        )
+        dist.all_to_all_single(
+            out, data.contiguous(),
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+            group=ep_group,
+        )
+        return out
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
     def forward(
         self,
-        hidden_states: Tensor,
-        top_k_indices: Tensor,
-        top_k_weights: Tensor,
+        hidden_states: Tensor,      # [T, D]
+        top_k_indices: Tensor,      # [T, k]  global expert ids
+        top_k_weights: Tensor,      # [T, k]
     ) -> Tensor:
         """Compute weighted sum of selected expert outputs.
 
         Args:
-            hidden_states: [T, D]
-            top_k_indices: [T, k]  — selected expert IDs.
-            top_k_weights: [T, k]  — normalised routing weights.
+            hidden_states:  [T, D]
+            top_k_indices:  [T, k]  — selected expert IDs (global).
+            top_k_weights:  [T, k]  — normalised routing weights.
 
         Returns:
             [T, D]  — accumulated expert output.
         """
+        ep_size, ep_rank, ep_group = _get_ep_info()
+
+        if ep_size == 1:
+            return self._forward_no_ep(hidden_states, top_k_indices, top_k_weights)
+        else:
+            return self._forward_ep(hidden_states, top_k_indices, top_k_weights,
+                                    ep_size, ep_group)
+
+    # ------------------------------------------------------------------
+    # EP = 1 path  (no communication)
+    # ------------------------------------------------------------------
+
+    def _forward_no_ep(
+        self,
+        hidden_states: Tensor,  # [T, D]
+        top_k_indices: Tensor,  # [T, k]
+        top_k_weights: Tensor,  # [T, k]
+    ) -> Tensor:
         T, D = hidden_states.shape
-        output = torch.zeros_like(hidden_states)
+        k = top_k_indices.shape[1]
 
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_indices, self.num_experts)  # [T, k, E]
-            expert_mask = expert_mask.permute(2, 1, 0)                 # [E, k, T]
-            active_experts = expert_mask.sum(dim=(1, 2)).nonzero(as_tuple=False)
+        # Flatten: one entry per (token, expert-slot) pair.
+        flat_ids  = top_k_indices.reshape(-1)                              # [T*k]
+        flat_w    = top_k_weights.reshape(-1)                              # [T*k]
+        flat_x    = hidden_states.unsqueeze(1).expand(-1, k, -1).reshape(-1, D)  # [T*k, D]
 
-        for row in active_experts:
-            eid = row[0].item()
-            k_pos, tok_idx = torch.where(expert_mask[eid])
-            x = hidden_states[tok_idx]                                  # [n_tok, D]
-            gate_proj, up_proj = F.linear(x, self.gate_up_proj[eid]).chunk(2, dim=-1)
-            x = F.silu(gate_proj) * up_proj
-            x = F.linear(x, self.down_proj[eid])                       # [n_tok, D]
-            x = x * top_k_weights[tok_idx, k_pos, None]
-            output.index_add_(0, tok_idx, x.to(output.dtype))
+        # Sort by expert so GroupedGEMM can process contiguous segments.
+        sort_idx = flat_ids.argsort(stable=True)
+        flat_x_s = flat_x[sort_idx]
+        flat_ids_s = flat_ids[sort_idx]   # local ids == global ids when EP=1
+        flat_w_s = flat_w[sort_idx]
 
-        return output
+        tokens_per_expert = torch.bincount(
+            flat_ids_s, minlength=self.num_local_experts
+        ).to(dtype=torch.int32, device='cpu')
+
+        out_sorted = self._compute_local(flat_x_s, flat_ids_s, flat_w_s, tokens_per_expert)
+
+        # Restore original order.
+        unsort_idx = sort_idx.argsort()
+        out = out_sorted[unsort_idx]       # [T*k, D]
+
+        # Accumulate k expert outputs per token.
+        return out.reshape(T, k, D).sum(dim=1)  # [T, D]
+
+    # ------------------------------------------------------------------
+    # EP > 1 path  (all-to-all dispatch + combine)
+    # ------------------------------------------------------------------
+
+    def _forward_ep(
+        self,
+        hidden_states: Tensor,  # [T, D]
+        top_k_indices: Tensor,  # [T, k]
+        top_k_weights: Tensor,  # [T, k]
+        ep_size: int,
+        ep_group,
+    ) -> Tensor:
+        T, D = hidden_states.shape
+        k = top_k_indices.shape[1]
+        device = hidden_states.device
+
+        # ── 1. Flatten (T, k) → T*k ──────────────────────────────────
+        flat_ids = top_k_indices.reshape(-1)                               # [T*k]
+        flat_w   = top_k_weights.reshape(-1)                               # [T*k]
+        flat_x   = hidden_states.unsqueeze(1).expand(-1, k, -1).reshape(-1, D)  # [T*k, D]
+
+        # ── 2. Sort by destination EP rank ───────────────────────────
+        dst_rank = flat_ids // self.num_local_experts                      # [T*k]
+        sort_idx = dst_rank.argsort(stable=True)
+        flat_x_s   = flat_x[sort_idx]
+        flat_ids_s = flat_ids[sort_idx]
+        flat_w_s   = flat_w[sort_idx]
+
+        # Save inverse permutation for the combine step.
+        unsort_idx = sort_idx.argsort()
+
+        # ── 3. Exchange token counts (metadata only) ──────────────────
+        dst_rank_s = dst_rank[sort_idx]
+        send_counts = torch.bincount(
+            dst_rank_s.to(torch.long), minlength=ep_size
+        ).to(dtype=torch.int64, device=device)
+
+        recv_counts = self._exchange_counts(send_counts, ep_group)
+
+        # ── 4. Dispatch tokens, expert ids, weights via all-to-all ───
+        recv_x   = self._all_to_all_tokens(flat_x_s,   send_counts, recv_counts, ep_group)
+        recv_ids = self._all_to_all_tokens(flat_ids_s, send_counts, recv_counts, ep_group)
+        recv_w   = self._all_to_all_tokens(flat_w_s,   send_counts, recv_counts, ep_group)
+
+        # ── 5. Convert global → local expert ids ─────────────────────
+        local_ids = recv_ids - self.local_expert_offset    # [N_recv]
+
+        # Sort received tokens by local expert for GroupedGEMM.
+        local_sort_idx = local_ids.argsort(stable=True)
+        recv_x_s   = recv_x[local_sort_idx]
+        local_ids_s = local_ids[local_sort_idx]
+        recv_w_s   = recv_w[local_sort_idx]
+
+        tokens_per_expert = torch.bincount(
+            local_ids_s.to(torch.long), minlength=self.num_local_experts
+        ).to(dtype=torch.int32, device='cpu')
+
+        # ── 6. Expert computation (GroupedGEMM or loop) ───────────────
+        local_out_s = self._compute_local(
+            recv_x_s, local_ids_s, recv_w_s, tokens_per_expert
+        )
+
+        # Restore received-order before combine.
+        local_unsort = local_sort_idx.argsort()
+        local_out = local_out_s[local_unsort]              # [N_recv, D]
+
+        # ── 7. Combine: send results back to originating ranks ────────
+        combined = self._all_to_all_tokens(
+            local_out,
+            recv_counts,   # now these are our send sizes
+            send_counts,   # and these are our recv sizes
+            ep_group,
+        )                                                  # [T*k, D]
+
+        # ── 8. Restore original (token, slot) order ──────────────────
+        combined = combined[unsort_idx]                    # [T*k, D]
+
+        # ── 9. Accumulate k expert contributions per token ────────────
+        return combined.reshape(T, k, D).sum(dim=1)        # [T, D]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
