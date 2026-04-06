@@ -132,14 +132,21 @@ def _chunk_gated_delta_rule(
     triu_mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(triu_mask, 0)
-    for i in range(1, chunk_size):
-        row = attn[..., i, :i].clone()
-        sub = attn[..., :i, :i].clone()
-        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    # A[i,j] = -(k_beta[i] @ key[j]) * decay[i,j]  for j < i, else 0
+    # (strictly lower-triangular)
+    A = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(triu_mask, 0)
+    # The 63-iteration Python loop + `attn += eye` was computing (I - A)^{-1}
+    # via forward substitution (proved by induction: result[i,j] = [(I-A)^{-1}]_{ij}).
+    # Replace with two solve_triangular calls that apply (I - A)^{-1} directly to the
+    # RHS matrices, avoiding both the Python loop and the full [B,H,C,C,C] inverse.
+    _eye = torch.eye(chunk_size, dtype=A.dtype, device=A.device)
+    I_minus_A = _eye - A          # unit lower-triangular [B, H, num_chunks, C, C]
+    value = torch.linalg.solve_triangular(
+        I_minus_A, v_beta.contiguous(), upper=False
+    )                             # [B, H, num_chunks, C, v_dim]
+    k_cumdecay = torch.linalg.solve_triangular(
+        I_minus_A, (k_beta * g.exp().unsqueeze(-1)).contiguous(), upper=False
+    )                             # [B, H, num_chunks, C, k_dim]
     state = (
         torch.zeros(B, H, k_dim, v_dim, device=query.device, dtype=torch.float32)
         if initial_state is None else initial_state.float()

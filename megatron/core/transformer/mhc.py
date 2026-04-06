@@ -41,20 +41,27 @@ from torch import Tensor
 _perm_mats_cache: dict = {}
 
 
-def _get_permutation_matrices(n: int, device: torch.device) -> Tensor:
+def _get_permutation_matrices(
+    n: int, device: torch.device, dtype: torch.dtype = torch.float32
+) -> Tensor:
     """Return all n! permutation matrices as a tensor of shape [n!, n, n].
 
-    Results are cached per (n, device) so that the allocation happens once.
+    Results are cached per (n, device, dtype) so that the allocation and dtype
+    conversion happen only once per unique combination.
     The identity permutation is always the first entry (index 0), matching
     the initialisation heuristic in ``ManifoldConstrainedHyperConnection``.
     """
-    key = (n, str(device))
+    key = (n, str(device), dtype)
     if key not in _perm_mats_cache:
-        perms = list(itertools.permutations(range(n)))   # identity first
-        idx = torch.tensor(perms, dtype=torch.long)
-        eye = torch.eye(n, dtype=torch.float32)
-        perm_mats = eye[idx]                             # [n!, n, n]
-        _perm_mats_cache[key] = perm_mats.to(device)
+        # Build float32 base first (reused across dtype variants on same device)
+        base_key = (n, str(device), torch.float32)
+        if base_key not in _perm_mats_cache:
+            perms = list(itertools.permutations(range(n)))   # identity first
+            idx = torch.tensor(perms, dtype=torch.long)
+            eye = torch.eye(n, dtype=torch.float32)
+            perm_mats = eye[idx]                             # [n!, n, n]
+            _perm_mats_cache[base_key] = perm_mats.to(device)
+        _perm_mats_cache[key] = _perm_mats_cache[base_key].to(dtype)
     return _perm_mats_cache[key]
 
 
@@ -177,7 +184,7 @@ class ManifoldConstrainedHyperConnection(nn.Module):
             beta:           [S, B, n]    — depth-connection gate weights.
         """
         n, S, B, D = X.shape
-        perms = _get_permutation_matrices(n, X.device)  # [n!, n, n]
+        perms = _get_permutation_matrices(n, X.device, X.dtype)  # [n!, n, n], dtype-cached
 
         if self.use_fused_kernel:
             from megatron.core.fusions.fused_mhc_width_connection import (
@@ -217,7 +224,7 @@ class ManifoldConstrainedHyperConnection(nn.Module):
             self.residual_scale * dynamic_res + self.static_alpha[n:],
             dim=-1,
         )                                             # [S, B, n!]
-        H_res = torch.einsum('...r, rij -> ...ij', res_coeff, perms.to(res_coeff.dtype))  # [S, B, n, n]
+        H_res = torch.einsum('...r, rij -> ...ij', res_coeff, perms)  # [S, B, n, n]
 
         # Apply H_res: new_residuals[..., i, :] = Σ_j H_res[..., i, j] * X[..., j, :]
         new_residuals = torch.einsum(

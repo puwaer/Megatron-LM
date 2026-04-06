@@ -16,9 +16,9 @@ Expert Parallelism (EP):
     the expert compute step.
   - Expert compute uses GroupedGEMM when available (grouped_gemm package),
     falling back to a Python loop otherwise.
-  - Checkpoint loading: when the saved checkpoint contains all num_experts
-    (e.g. trained with EP=1), _load_from_state_dict automatically slices the
-    correct shard for the current EP rank.
+  - Checkpoint format: always saved as full [num_experts, ...] tensors regardless
+    of EP size (sharded_state_dict all-gathers before saving).  _load_from_state_dict
+    automatically slices the correct shard when loading into any EP configuration.
 """
 
 from typing import Optional, Tuple
@@ -41,6 +41,12 @@ try:
 except Exception:
     gg = None
     _HAVE_GROUPED_GEMM = False
+
+try:
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
+    _HAVE_SHARDED_TENSOR = True
+except ImportError:
+    _HAVE_SHARDED_TENSOR = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -228,6 +234,85 @@ class FujiRoutedExperts(nn.Module):
                     f"num_experts={self.num_experts}."
                 )
 
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Dist-checkpointing sharded state dict — always saves in EP=1 format.
+
+        Even when EP > 1, the expert weights are gathered across all EP ranks
+        via all_gather_into_tensor so that the saved tensor always has the full
+        [num_experts, ...] shape (identical to an EP=1 checkpoint).
+
+        replica_id encodes (ep_rank, dp_rank) so that exactly one rank writes:
+          EP=1:  replica_id = dp_rank
+          EP>1:  replica_id = ep_rank * dp_size + dp_rank
+        Only the rank with replica_id == 0 (i.e. ep_rank=0, dp_rank=0) writes.
+
+        This guarantees that checkpoints are interchangeable regardless of the
+        EP size used during training, and that _load_from_state_dict can always
+        slice the correct shard when loading into any EP configuration.
+        """
+        ep_size, ep_rank, ep_group = _get_ep_info()
+
+        # DP rank/size — needed so that only one DP replica writes.
+        try:
+            dp_rank = _parallel_state.get_data_parallel_rank(with_context_parallel=True)
+            dp_size = _parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+        except Exception:
+            dp_rank, dp_size = 0, 1
+
+        if not _HAVE_SHARDED_TENSOR:
+            # Fallback for environments without dist_checkpointing.
+            # Gather to full [num_experts, ...] even in this path.
+            sharded_sd = {}
+            for param_name in ('gate_up_proj', 'down_proj'):
+                param = getattr(self, param_name)
+                if ep_size > 1:
+                    full_shape = (self.num_experts, *param.data.shape[1:])
+                    full = torch.empty(full_shape, dtype=param.data.dtype, device=param.data.device)
+                    dist.all_gather_into_tensor(full, param.data.contiguous(), group=ep_group)
+                    sharded_sd[prefix + param_name] = full
+                else:
+                    sharded_sd[prefix + param_name] = param.data
+            return sharded_sd
+
+        prepend_axis_num = len(sharded_offsets)
+        sharded_sd = {}
+
+        for param_name in ('gate_up_proj', 'down_proj'):
+            key   = prefix + param_name
+            param = getattr(self, param_name)
+
+            if ep_size > 1:
+                # All-gather local shard → full [num_experts, ...] tensor.
+                # Ranks are ordered by ep_rank, matching local_expert_offset layout.
+                full_shape = (self.num_experts, *param.data.shape[1:])
+                full_tensor = torch.empty(
+                    full_shape, dtype=param.data.dtype, device=param.data.device
+                )
+                dist.all_gather_into_tensor(
+                    full_tensor, param.data.contiguous(), group=ep_group
+                )
+                # replica_id = ep_rank * dp_size + dp_rank
+                # → 0 only when ep_rank=0 and dp_rank=0 (sole writer).
+                replica_id = ep_rank * dp_size + dp_rank
+                sharded_sd[key] = ShardedTensor.from_rank_offsets(
+                    key,
+                    full_tensor,
+                    *sharded_offsets,
+                    replica_id=replica_id,
+                    prepend_axis_num=prepend_axis_num,
+                )
+            else:
+                # EP=1: expert weights are replicated across DP ranks.
+                # replica_id = dp_rank → only DP rank 0 writes.
+                sharded_sd[key] = ShardedTensor.from_rank_offsets(
+                    key,
+                    param.data,
+                    *sharded_offsets,
+                    replica_id=dp_rank,
+                    prepend_axis_num=prepend_axis_num,
+                )
+        return sharded_sd
+
     # ------------------------------------------------------------------
     # Internal: grouped-GEMM expert compute on locally-owned tokens
     # ------------------------------------------------------------------
@@ -400,7 +485,7 @@ class FujiRoutedExperts(nn.Module):
 
         tokens_per_expert = torch.bincount(
             flat_ids_s, minlength=self.num_local_experts
-        ).to(dtype=torch.int32, device='cpu')
+        ).to(dtype=torch.int64, device='cpu')
 
         out_sorted = self._compute_local(flat_x_s, flat_ids_s, flat_w_s, tokens_per_expert)
 
@@ -466,7 +551,7 @@ class FujiRoutedExperts(nn.Module):
 
         tokens_per_expert = torch.bincount(
             local_ids_s.to(torch.long), minlength=self.num_local_experts
-        ).to(dtype=torch.int32, device='cpu')
+        ).to(dtype=torch.int64, device='cpu')
 
         # ── 6. Expert computation (GroupedGEMM or loop) ───────────────
         local_out_s = self._compute_local(
@@ -538,6 +623,25 @@ class FujiSparseMoE(nn.Module):
         )
         self.shared_expert      = _SwiGLUMLP(hidden, shared_inter)
         self.shared_expert_gate = nn.Linear(hidden, 1, bias=False)
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Sharded state dict for dist_checkpointing.
+
+        Delegates to each child's sharded_state_dict (or fallback) so that
+        FujiRoutedExperts.sharded_state_dict is correctly invoked for EP sharding.
+        Without this override, the default traversal calls state_dict() on this
+        entire module and wraps expert weights as non-sharded tensors, causing a
+        global shape mismatch when the checkpoint has EP=1 shapes.
+        """
+        from megatron.core.transformer.utils import sharded_state_dict_default
+        sharded_sd = {}
+        for name, module in self.named_children():
+            sharded_sd.update(
+                sharded_state_dict_default(
+                    module, f'{prefix}{name}.', sharded_offsets, metadata
+                )
+            )
+        return sharded_sd
 
     def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
         """MoE forward pass.
