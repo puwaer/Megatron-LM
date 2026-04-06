@@ -203,6 +203,16 @@ class NgramHashMapping(nn.Module):
             offsets.append(offsets[-1] + vs)
         self.register_buffer('offsets', torch.tensor(offsets, dtype=torch.long))
 
+        # Precompute per-order head offsets: [num_orders, n_head_per_ngram]
+        # Avoids `torch.arange(...) * prime` allocation on every forward call.
+        all_ho = []
+        for o_idx, prime in enumerate(self.primes):
+            ho = offsets[o_idx] + torch.arange(config.n_head_per_ngram, dtype=torch.long) * prime
+            all_ho.append(ho)
+        # persistent=False: このバッファは計算用途のみ。
+        # checkpoint への保存・読み込み対象外にする。
+        self.register_buffer('head_offsets_per_order', torch.stack(all_ho), persistent=False)  # [num_orders, n_head]
+
         # Precompute hash multipliers: [num_ngram_orders, n_head, max_ngram_size]
         multipliers = self._build_multipliers(config, layer_id)
         self.register_buffer('multipliers', multipliers)
@@ -260,9 +270,7 @@ class NgramHashMapping(nn.Module):
                 hash_val = hash_val ^ products[..., pos]
 
             # Map to table index with offset for MultiHeadEmbedding flat layout
-            head_offset = offset + torch.arange(
-                self.config.n_head_per_ngram, device=device
-            ) * prime  # [n_head]
+            head_offset = self.head_offsets_per_order[order_idx]  # [n_head] — precomputed
             indices = (hash_val % prime) + head_offset  # [B, S, n_head]
             all_indices.append(indices)
 
