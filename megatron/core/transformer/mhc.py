@@ -78,7 +78,8 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        out = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        x_f = x.float()
+        out = x_f * torch.rsqrt((x_f * x_f).mean(-1, keepdim=True) + self.eps)
         return (out * (1.0 + self.weight.float())).type_as(x)
 
 
@@ -231,8 +232,8 @@ class ManifoldConstrainedHyperConnection(nn.Module):
             '...ij, ...jd -> ...id', H_res, X_sb
         )                                             # [S, B, n, D]
 
-        # Branch input: gated weighted sum over streams
-        branch_input = (alpha_pre.unsqueeze(-1) * X_sb).sum(dim=-2)  # [S, B, D]
+        # Branch input: gated weighted sum over streams (einsum avoids [S,B,n,D] intermediate)
+        branch_input = torch.einsum('...n,...nd->...d', alpha_pre, X_sb)  # [S, B, D]
 
         # ---- Depth weights (beta) ----------------------------------------
         dc = normed @ self.dynamic_beta_fn            # [S, B, n]

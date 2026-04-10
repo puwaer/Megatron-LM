@@ -190,7 +190,7 @@ class FujiBlock(TransformerBlock):
         """Instantiate and attach EngramModule to each eligible layer."""
         target_layer_ids = set(engram_config.engram_layer_ids)
         for layer in self.layers:
-            if not isinstance(layer, MHCTransformerLayer):
+            if not isinstance(layer, (MHCTransformerLayer, FujiLinearAttentionDecoderLayer)):
                 continue
             # layer.layer_number is 1-indexed; convert to 0-indexed global ID
             layer_idx = layer.layer_number - 1
@@ -259,7 +259,7 @@ class FujiBlock(TransformerBlock):
         if use_mhc:
             n = self.config.mhc_num_streams
             if self.pre_process:
-                # Expand the passed hidden_states
+                # Replicate hidden_states across n streams: [S,B,D] → [n,S,B,D]
                 hidden_states = hidden_states.unsqueeze(0).expand(n, -1, -1, -1).contiguous()
             else:
                 # In non-pre_process stages TransformerBlock.forward() uses
@@ -272,7 +272,7 @@ class FujiBlock(TransformerBlock):
         # --- Inject input_ids for Engram ---
         if input_ids is not None:
             for layer in self.layers:
-                if isinstance(layer, MHCTransformerLayer):
+                if isinstance(layer, (MHCTransformerLayer, FujiLinearAttentionDecoderLayer)):
                     layer._current_input_ids = input_ids
 
         try:
@@ -280,7 +280,7 @@ class FujiBlock(TransformerBlock):
         finally:
             # Clear even on exception
             for layer in self.layers:
-                if isinstance(layer, MHCTransformerLayer):
+                if isinstance(layer, (MHCTransformerLayer, FujiLinearAttentionDecoderLayer)):
                     layer._current_input_ids = None
 
         # --- mHC: collapse [n, S, B, D] → [S, B, D] ---
@@ -294,7 +294,7 @@ class FujiBlock(TransformerBlock):
             n_actual = h.shape[0]
             S, B, D = h.shape[1], h.shape[2], h.shape[3]
             # Permute to [S, B, n, D] then flatten to [S, B, n*D]
-            h = h.permute(1, 2, 0, 3).reshape(S, B, n_actual * D)
+            h = h.permute(1, 2, 0, 3).contiguous().reshape(S, B, n_actual * D)
             h = self.stream_proj(h)  # [S, B, D]
 
             if extra is not None:

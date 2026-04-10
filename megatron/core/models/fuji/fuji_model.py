@@ -135,34 +135,15 @@ class FujiModel(GPTModel):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
-
-    # ------------------------------------------------------------------
-    # Decoder construction override
-    # ------------------------------------------------------------------
-
-    def _build_decoder(self, transformer_layer_spec, vp_stage):
-        """Override to construct a FujiBlock instead of a TransformerBlock.
-
-        GPTModel.__init__ calls ``self.decoder = TransformerBlock(...)``.
-        We intercept this by overriding _build_decoder.
-
-        NOTE: GPTModel does NOT have a _build_decoder hook — we monkey-patch
-        the decoder attribute after the super().__init__() call above by
-        replacing the TransformerBlock that super() created with a FujiBlock.
-        See post-init patching in __init__.
-        """
-        # Not actually called — see _replace_decoder_with_fuji_block below.
-        pass
-
-    def __init_subclass__(cls, **kwargs):  # noqa: D401
-        super().__init_subclass__(**kwargs)
-
-    # After super().__init__() has run, replace self.decoder with a FujiBlock.
-    # We piggy-back on __init__ by doing this replacement at the end.
-    # (Calling super().__init__ creates self.decoder as TransformerBlock; we replace it.)
+        # Replace the TransformerBlock created by GPTModel.__init__ with FujiBlock.
+        # Must be called AFTER super().__init__ since GPTModel builds self.decoder there.
+        self._replace_decoder()
 
     def _replace_decoder(self) -> None:
         """Replace the TransformerBlock decoder with a FujiBlock after super init."""
+        # Delete the TransformerBlock built by GPTModel.__init__ to free its
+        # parameters before allocating FujiBlock (avoids doubling decoder memory).
+        del self.decoder
         # Re-create the decoder as a FujiBlock using the same parameters
         self.decoder = FujiBlock(
             config=self.config,
@@ -255,6 +236,7 @@ def build_fuji_model(
     Returns:
         A fully-initialised FujiModel with FujiBlock as its decoder.
     """
+    # FujiModel.__init__ automatically calls _replace_decoder().
     model = FujiModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
@@ -263,6 +245,4 @@ def build_fuji_model(
         engram_config=engram_config,
         **kwargs,
     )
-    # Replace TransformerBlock (created by GPTModel.__init__) with FujiBlock
-    model._replace_decoder()
     return model

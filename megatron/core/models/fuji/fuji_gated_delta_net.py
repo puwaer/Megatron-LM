@@ -131,7 +131,7 @@ def _chunk_gated_delta_rule(
     g = g.reshape(B, H, -1, chunk_size)
     triu_mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
     g = g.cumsum(dim=-1)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    decay_mask = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()
     # A[i,j] = -(k_beta[i] @ key[j]) * decay[i,j]  for j < i, else 0
     # (strictly lower-triangular)
     A = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(triu_mask, 0)
@@ -224,7 +224,7 @@ class _RMSNormGated(nn.Module):
     def forward(self, x: Tensor, gate: Tensor) -> Tensor:
         dtype = x.dtype
         x = x.float()
-        var = x.pow(2).mean(-1, keepdim=True)
+        var = (x * x).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
         x = self.weight * x.to(dtype)
         return x * F.silu(gate.float()).to(dtype)

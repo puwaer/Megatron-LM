@@ -22,7 +22,7 @@ from megatron.training import (
     pretrain
 )
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.utils import get_batch_on_this_tp_rank, is_first_or_last_pipeline_stage
+from megatron.training.utils import get_batch_on_this_tp_rank, is_first_or_last_pipeline_stage, average_losses_across_data_parallel_group
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.utils import StragglerDetector
@@ -79,7 +79,6 @@ def fuji_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
         rotary_percent=args.rotary_percent,
         engram_config=engram_config,
     )
-    model._replace_decoder()
 
     return model
 
@@ -168,7 +167,7 @@ def loss_func(loss_mask, output_tensor):
     """Loss function."""
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum().clamp(min=1.0)
 
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
@@ -180,8 +179,6 @@ def add_fuji_args(parser):
     # registered automatically via ArgumentGroupFactory(TransformerConfig) in
     # megatron/training/arguments.py. Re-registering them here would cause a conflict.
     return parser
-
-from megatron.training.utils import average_losses_across_data_parallel_group
 
 if __name__ == "__main__":
     pretrain(

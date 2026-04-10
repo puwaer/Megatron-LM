@@ -27,6 +27,7 @@ Tensor parallel notes:
 
 import unicodedata
 from dataclasses import dataclass, field
+from functools import reduce
 from typing import List, Optional
 
 import torch
@@ -248,15 +249,13 @@ class NgramHashMapping(nn.Module):
             prime = self.primes[order_idx]
             offset = self.offsets[order_idx]  # scalar
 
-            # Build k-gram sequences by stacking shifted versions of compressed_ids
-            # Shape: [B, S, k] — pad with 0 for positions before the sequence starts
-            ngrams = torch.stack(
-                [
-                    F.pad(compressed_ids[:, i:], (0, i), value=0)[:, :S]
-                    for i in range(k)
-                ],
-                dim=-1,
-            )  # [B, S, k]
+            # Build k-gram sequences: ngrams[b, s, i] = compressed_ids[b, s+i]
+            # Pad by repeating the last token to avoid spurious hash entries
+            # from artificial zero-valued tokens at the sequence boundary.
+            last_tok = compressed_ids[:, -1:]  # [B, 1]
+            pad = last_tok.expand(-1, k - 1)  # [B, k-1]
+            padded = torch.cat([compressed_ids, pad], dim=1)  # [B, S+k-1]
+            ngrams = padded.unfold(1, k, 1)  # [B, S, k]
 
             # Hash per head: multipliers [n_head, k] (trimmed to k positions)
             mults = self.multipliers[order_idx, :, :k]  # [n_head, k]
@@ -264,10 +263,8 @@ class NgramHashMapping(nn.Module):
             # XOR-mix hash: sum of (token * multiplier) then XOR cascade
             # Broadcast: ngrams [B, S, k] × mults [n_head, k] → [B, S, n_head, k]
             products = ngrams.unsqueeze(2) * mults.unsqueeze(0).unsqueeze(0)  # [B,S,H,k]
-            # XOR across token positions (simulate avalanche property)
-            hash_val = products[..., 0]
-            for pos in range(1, k):
-                hash_val = hash_val ^ products[..., pos]
+            # XOR across token positions
+            hash_val = reduce(torch.bitwise_xor, products.unbind(-1))
 
             # Map to table index with offset for MultiHeadEmbedding flat layout
             head_offset = self.head_offsets_per_order[order_idx]  # [n_head] — precomputed
@@ -334,6 +331,7 @@ class ShortConv(nn.Module):
             channels, channels, kernel_size=kernel_size,
             padding=kernel_size - 1, groups=channels,  # depthwise
         )
+        self._trim = -(kernel_size - 1) if kernel_size > 1 else None
 
     def forward(self, x: Tensor) -> Tensor:
         """Apply short convolution.
@@ -348,7 +346,8 @@ class ShortConv(nn.Module):
         x = x.permute(0, 2, 1)
         x = self.conv(x)
         # Trim extra padding to keep length S
-        x = x[..., :-(self.conv.kernel_size[0] - 1)] if self.conv.kernel_size[0] > 1 else x
+        if self._trim is not None:
+            x = x[..., :self._trim]
         return x.permute(0, 2, 1)
 
 
