@@ -101,7 +101,7 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
         if mlp_only:
             self.mlp = FujiDenseMLP(config)
         else:
-            self.mlp = FujiSparseMoE(config)
+            self.mlp = FujiSparseMoE(config, layer_number=self.layer_number)
 
         # mHC connection (created if enabled in config)
         self.mhc: Optional[ManifoldConstrainedHyperConnection] = None
@@ -169,7 +169,7 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
         attention_mask: Optional[Tensor] = None,
         inference_cache: Optional[GatedDeltaNetInferenceCache] = None,
         **kwargs,
-    ) -> Tuple[Tensor, None]:
+    ) -> Tuple[Tensor, Optional[Tensor]]:
         """Forward pass.
 
         When mHC is enabled, hidden_states is [n, S, B, D] and mHC aggregate /
@@ -184,7 +184,8 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
             **kwargs:        Ignored (for interface compatibility with TransformerLayer).
 
         Returns:
-            (hidden_states, None)  — context is None for linear attention.
+            (hidden_states, router_logits) — router_logits is a Tensor for MoE layers,
+            None for dense MLP layers.
         """
         input_ids: Optional[Tensor] = getattr(self, '_current_input_ids', None)
 
@@ -197,7 +198,7 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
                 # Engram in Megatron uses [S,B,D] convention
                 x_in = x_in + self.engram(input_ids, x_in)
 
-            x_out, router_logits = self._layer_forward(x_in, attention_mask, inference_cache, **kwargs)
+            x_out, _router_logits = self._layer_forward(x_in, attention_mask, inference_cache, **kwargs)
             hidden_states = self.mhc.distribute_output(hidden_states, x_out)  # [n,S,B,D]
 
         else:
@@ -205,7 +206,8 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
             if self.engram is not None and input_ids is not None:
                 hidden_states = hidden_states + self.engram(input_ids, hidden_states)
 
-            hidden_states, router_logits = self._layer_forward(hidden_states, attention_mask, inference_cache, **kwargs)
+            hidden_states, _router_logits = self._layer_forward(hidden_states, attention_mask, inference_cache, **kwargs)
 
-        # Second return value carries router_logits (for MoE aux loss) instead of context
-        return hidden_states, router_logits
+        # Return None as context (matching TransformerLayer interface).
+        # MoE auxiliary loss is handled via save_to_aux_losses_tracker() inside FujiTopKRouter.
+        return hidden_states, None

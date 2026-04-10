@@ -36,6 +36,15 @@ except ImportError:
     _HAVE_PARALLEL_STATE = False
 
 try:
+    from megatron.core.transformer.moe.moe_utils import (
+        MoEAuxLossAutoScaler,
+        save_to_aux_losses_tracker,
+    )
+    _HAVE_AUX_LOSS = True
+except ImportError:
+    _HAVE_AUX_LOSS = False
+
+try:
     from megatron.core.transformer.moe import grouped_gemm_util as gg
     _HAVE_GROUPED_GEMM = gg.grouped_gemm_is_available()
 except Exception:
@@ -87,16 +96,24 @@ class _SwiGLUMLP(nn.Module):
 
 
 class FujiTopKRouter(nn.Module):
-    """Softmax-based top-k token router.
+    """Softmax-based top-k token router with Switch-style load-balancing loss.
 
     Computes per-token routing probabilities, selects top-k experts, and
     optionally normalises the selected weights to sum to 1.
 
+    When ``moe_aux_loss_coeff > 0`` and the module is in training mode, a
+    Switch Transformer load-balancing auxiliary loss is computed and attached
+    to the activation via ``MoEAuxLossAutoScaler`` so that gradients flow
+    through the router even when the main loss does not directly depend on
+    the routing probabilities.
+
     Args:
-        num_experts:      Total number of routed expert slots.
+        num_experts:        Total number of routed expert slots.
         num_experts_per_tok: Number of experts selected per token (top-k).
-        hidden_size:      Input feature dimension.
-        norm_topk_prob:   If True, normalise selected probabilities.
+        hidden_size:        Input feature dimension.
+        norm_topk_prob:     If True, normalise selected probabilities.
+        moe_aux_loss_coeff: Coefficient for the load-balancing auxiliary loss.
+        num_layers:         Total number of transformer layers (for logging).
     """
 
     def __init__(
@@ -105,11 +122,16 @@ class FujiTopKRouter(nn.Module):
         num_experts_per_tok: int,
         hidden_size: int,
         norm_topk_prob: bool = True,
+        moe_aux_loss_coeff: float = 0.0,
+        num_layers: int = 1,
     ) -> None:
         super().__init__()
         self.top_k = num_experts_per_tok
         self.num_experts = num_experts
         self.norm_topk_prob = norm_topk_prob
+        self.moe_aux_loss_coeff = moe_aux_loss_coeff
+        self.num_layers = num_layers
+        self.layer_number: Optional[int] = None  # Set by FujiSparseMoE after construction
         self.weight = nn.Parameter(torch.zeros(num_experts, hidden_size))
 
     def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -119,15 +141,46 @@ class FujiTopKRouter(nn.Module):
             hidden_states: [T, D]  (T = num_tokens after reshaping)
 
         Returns:
-            router_logits:  [T, num_experts]  — full probability vector (for aux loss).
-            routing_weights:[T, top_k]        — selected and optionally normalised weights.
+            routing_probs:   [T, num_experts]  — full probability vector.
+            routing_weights: [T, top_k]        — selected and optionally normalised weights.
             selected_experts:[T, top_k]        — expert indices (long).
         """
-        router_logits = F.softmax(F.linear(hidden_states, self.weight), dim=-1, dtype=torch.float)
-        top_weights, top_indices = torch.topk(router_logits, self.top_k, dim=-1)
+        routing_probs = F.softmax(F.linear(hidden_states, self.weight), dim=-1, dtype=torch.float)
+        top_weights, top_indices = torch.topk(routing_probs, self.top_k, dim=-1)
         if self.norm_topk_prob:
-            top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-9)
-        return router_logits, top_weights.to(hidden_states.dtype), top_indices
+            top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-6)
+
+        # --- Auxiliary load-balancing loss (Switch Transformer) ---
+        if (
+            _HAVE_AUX_LOSS
+            and self.training
+            and self.moe_aux_loss_coeff > 0
+            and torch.is_grad_enabled()
+        ):
+            T = hidden_states.shape[0]
+            # f_i: fraction of tokens dispatched to expert i
+            routing_map = torch.zeros_like(routing_probs)
+            routing_map.scatter_(1, top_indices, 1.0)
+            tokens_per_expert = routing_map.sum(dim=0)  # [num_experts]
+            f = tokens_per_expert / (T * self.top_k)
+            # P_i: mean routing probability for expert i
+            P = routing_probs.mean(dim=0)  # [num_experts]
+            # Switch load-balancing loss: E * sum(f_i * P_i)
+            aux_loss = self.num_experts * torch.dot(f, P) * self.moe_aux_loss_coeff
+
+            # Attach aux loss gradient to the hidden_states activation
+            hidden_states = MoEAuxLossAutoScaler.apply(hidden_states, aux_loss)
+
+            # Log to Megatron's aux loss tracker
+            if self.layer_number is not None:
+                save_to_aux_losses_tracker(
+                    "load_balancing_loss",
+                    aux_loss / self.moe_aux_loss_coeff,
+                    self.layer_number,
+                    self.num_layers,
+                )
+
+        return routing_probs, top_weights.to(hidden_states.dtype), top_indices
 
 
 class FujiRoutedExperts(nn.Module):
@@ -593,12 +646,13 @@ class FujiSparseMoE(nn.Module):
     The router operates over the flattened token dimension [S*B, D].
 
     Args:
-        config:  TransformerConfig.  Used fields:
-                 hidden_size, moe_intermediate_size, shared_expert_intermediate_size,
-                 num_experts, num_experts_per_tok, norm_topk_prob.
+        config:       TransformerConfig.  Used fields:
+                      hidden_size, moe_intermediate_size, shared_expert_intermediate_size,
+                      num_experts, num_experts_per_tok, norm_topk_prob, moe_aux_loss_coeff.
+        layer_number: 1-indexed layer number (for aux loss logging).
     """
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, layer_number: Optional[int] = None) -> None:
         super().__init__()
         hidden          = config.hidden_size
         moe_inter       = getattr(config, 'moe_intermediate_size', 512)
@@ -608,13 +662,18 @@ class FujiSparseMoE(nn.Module):
         num_experts     = getattr(config, 'num_moe_experts', getattr(config, 'num_experts', 64))
         num_experts_tok = getattr(config, 'moe_router_topk', getattr(config, 'num_experts_per_tok', 2))
         norm_topk       = getattr(config, 'norm_topk_prob', True)
+        aux_loss_coeff  = getattr(config, 'moe_aux_loss_coeff', 0.0)
+        num_layers      = getattr(config, 'num_layers', 1)
 
         self.gate = FujiTopKRouter(
             num_experts=num_experts,
             num_experts_per_tok=num_experts_tok,
             hidden_size=hidden,
             norm_topk_prob=norm_topk,
+            moe_aux_loss_coeff=aux_loss_coeff,
+            num_layers=num_layers,
         )
+        self.gate.layer_number = layer_number
         self.experts = FujiRoutedExperts(
             num_experts=num_experts,
             hidden_size=hidden,
@@ -649,8 +708,10 @@ class FujiSparseMoE(nn.Module):
             hidden_states: [S, B, D]  (Megatron sequence-first).
 
         Returns:
-            output:       [S, B, D]
-            router_logits:[T, num_experts]  for auxiliary load-balancing loss.
+            output:        [S, B, D]
+            router_logits: [T, num_experts]  — routing probability vector.
+                           Auxiliary load-balancing loss is computed and registered
+                           inside FujiTopKRouter via save_to_aux_losses_tracker().
         """
         S, B, D = hidden_states.shape
         x = hidden_states.reshape(-1, D)                   # [T, D]

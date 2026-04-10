@@ -260,13 +260,13 @@ class FujiBlock(TransformerBlock):
             n = self.config.mhc_num_streams
             if self.pre_process:
                 # Replicate hidden_states across n streams: [S,B,D] → [n,S,B,D]
-                hidden_states = hidden_states.unsqueeze(0).expand(n, -1, -1, -1).clone()
+                hidden_states = hidden_states.unsqueeze(0).expand(n, -1, -1, -1).contiguous()
             else:
                 # In non-pre_process stages TransformerBlock.forward() uses
                 # self.input_tensor; expand that instead.
                 if self.input_tensor is not None:
                     self.input_tensor = (
-                        self.input_tensor.unsqueeze(0).expand(n, -1, -1, -1).clone()
+                        self.input_tensor.unsqueeze(0).expand(n, -1, -1, -1).contiguous()
                     )
 
         # --- Inject input_ids for Engram ---
@@ -294,7 +294,7 @@ class FujiBlock(TransformerBlock):
             n_actual = h.shape[0]
             S, B, D = h.shape[1], h.shape[2], h.shape[3]
             # Permute to [S, B, n, D] then flatten to [S, B, n*D]
-            h = h.permute(1, 2, 0, 3).reshape(S, B, n_actual * D)
+            h = h.permute(1, 2, 0, 3).contiguous().reshape(S, B, n_actual * D)
             h = self.stream_proj(h)  # [S, B, D]
 
             if extra is not None:

@@ -250,8 +250,11 @@ class NgramHashMapping(nn.Module):
             offset = self.offsets[order_idx]  # scalar
 
             # Build k-gram sequences: ngrams[b, s, i] = compressed_ids[b, s+i]
-            # Single pad + unfold replaces k separate F.pad+slice calls
-            padded = F.pad(compressed_ids, (0, k - 1), value=0)  # [B, S+k-1]
+            # Pad by repeating the last token to avoid spurious hash entries
+            # from artificial zero-valued tokens at the sequence boundary.
+            last_tok = compressed_ids[:, -1:]  # [B, 1]
+            pad = last_tok.expand(-1, k - 1)  # [B, k-1]
+            padded = torch.cat([compressed_ids, pad], dim=1)  # [B, S+k-1]
             ngrams = padded.unfold(1, k, 1)  # [B, S, k]
 
             # Hash per head: multipliers [n_head, k] (trimmed to k positions)

@@ -135,9 +135,15 @@ class FujiModel(GPTModel):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
+        # Replace the TransformerBlock created by GPTModel.__init__ with FujiBlock.
+        # Must be called AFTER super().__init__ since GPTModel builds self.decoder there.
+        self._replace_decoder()
 
     def _replace_decoder(self) -> None:
         """Replace the TransformerBlock decoder with a FujiBlock after super init."""
+        # Delete the TransformerBlock built by GPTModel.__init__ to free its
+        # parameters before allocating FujiBlock (avoids doubling decoder memory).
+        del self.decoder
         # Re-create the decoder as a FujiBlock using the same parameters
         self.decoder = FujiBlock(
             config=self.config,
@@ -230,6 +236,7 @@ def build_fuji_model(
     Returns:
         A fully-initialised FujiModel with FujiBlock as its decoder.
     """
+    # FujiModel.__init__ automatically calls _replace_decoder().
     model = FujiModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
@@ -238,6 +245,4 @@ def build_fuji_model(
         engram_config=engram_config,
         **kwargs,
     )
-    # Replace TransformerBlock (created by GPTModel.__init__) with FujiBlock
-    model._replace_decoder()
     return model

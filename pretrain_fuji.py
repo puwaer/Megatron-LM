@@ -79,7 +79,6 @@ def fuji_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
         rotary_percent=args.rotary_percent,
         engram_config=engram_config,
     )
-    model._replace_decoder()
 
     return model
 
@@ -168,7 +167,7 @@ def loss_func(loss_mask, output_tensor):
     """Loss function."""
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum().clamp(min=1.0)
 
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
