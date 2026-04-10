@@ -136,31 +136,6 @@ class FujiModel(GPTModel):
             vp_stage=vp_stage,
         )
 
-    # ------------------------------------------------------------------
-    # Decoder construction override
-    # ------------------------------------------------------------------
-
-    def _build_decoder(self, transformer_layer_spec, vp_stage):
-        """Override to construct a FujiBlock instead of a TransformerBlock.
-
-        GPTModel.__init__ calls ``self.decoder = TransformerBlock(...)``.
-        We intercept this by overriding _build_decoder.
-
-        NOTE: GPTModel does NOT have a _build_decoder hook — we monkey-patch
-        the decoder attribute after the super().__init__() call above by
-        replacing the TransformerBlock that super() created with a FujiBlock.
-        See post-init patching in __init__.
-        """
-        # Not actually called — see _replace_decoder_with_fuji_block below.
-        pass
-
-    def __init_subclass__(cls, **kwargs):  # noqa: D401
-        super().__init_subclass__(**kwargs)
-
-    # After super().__init__() has run, replace self.decoder with a FujiBlock.
-    # We piggy-back on __init__ by doing this replacement at the end.
-    # (Calling super().__init__ creates self.decoder as TransformerBlock; we replace it.)
-
     def _replace_decoder(self) -> None:
         """Replace the TransformerBlock decoder with a FujiBlock after super init."""
         # Re-create the decoder as a FujiBlock using the same parameters

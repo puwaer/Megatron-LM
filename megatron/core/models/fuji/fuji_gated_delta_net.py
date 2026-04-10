@@ -224,7 +224,7 @@ class _RMSNormGated(nn.Module):
     def forward(self, x: Tensor, gate: Tensor) -> Tensor:
         dtype = x.dtype
         x = x.float()
-        var = x.pow(2).mean(-1, keepdim=True)
+        var = (x * x).mean(-1, keepdim=True)
         x = x * torch.rsqrt(var + self.eps)
         x = self.weight * x.to(dtype)
         return x * F.silu(gate.float()).to(dtype)

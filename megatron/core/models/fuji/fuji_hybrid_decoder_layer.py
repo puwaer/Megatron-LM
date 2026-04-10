@@ -47,7 +47,8 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))  # (1+w) init → zero
 
     def forward(self, x: Tensor) -> Tensor:
-        out = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        x_f = x.float()
+        out = x_f * torch.rsqrt((x_f * x_f).mean(-1, keepdim=True) + self.eps)
         return (out * (1.0 + self.weight.float())).type_as(x)
 
 
@@ -108,7 +109,9 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
             self.mhc = ManifoldConstrainedHyperConnection(
                 hidden_size=D,
                 num_streams=config.mhc_num_streams,
+                layer_index=self.layer_number,
                 sinkhorn_iterations=config.mhc_sinkhorn_iterations,
+                use_fused_kernel=getattr(config, 'mhc_use_fused_kernel', False),
             )
 
         # Engram module — attached externally by FujiBlock
@@ -127,7 +130,7 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
         attention_mask: Optional[Tensor],
         inference_cache: Optional[GatedDeltaNetInferenceCache],
         **kwargs,
-    ) -> Tensor:
+    ) -> Tuple[Tensor, Optional[Tensor]]:
         """Single-stream forward: attention + MLP + residuals.
 
         Args:
@@ -136,7 +139,7 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
             inference_cache: GatedDeltaNet inference cache (optional).
 
         Returns:
-            [S, B, D]
+            ([S, B, D], router_logits or None)
         """
         # ── Linear attention ──────────────────────────────────────────
         residual = x
@@ -151,10 +154,10 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
         # ── Feed-forward ──────────────────────────────────────────────
         residual = x
         x = self.post_attention_layernorm(x)
-        x, _router_logits = self.mlp(x)
+        x, router_logits = self.mlp(x)
         x = residual + x
 
-        return x
+        return x, router_logits
 
     # ------------------------------------------------------------------
     # Public forward (handles mHC and Engram)
@@ -194,7 +197,7 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
                 # Engram in Megatron uses [S,B,D] convention
                 x_in = x_in + self.engram(input_ids, x_in)
 
-            x_out = self._layer_forward(x_in, attention_mask, inference_cache, **kwargs)
+            x_out, router_logits = self._layer_forward(x_in, attention_mask, inference_cache, **kwargs)
             hidden_states = self.mhc.distribute_output(hidden_states, x_out)  # [n,S,B,D]
 
         else:
@@ -202,7 +205,7 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
             if self.engram is not None and input_ids is not None:
                 hidden_states = hidden_states + self.engram(input_ids, hidden_states)
 
-            hidden_states = self._layer_forward(hidden_states, attention_mask, inference_cache, **kwargs)
+            hidden_states, router_logits = self._layer_forward(hidden_states, attention_mask, inference_cache, **kwargs)
 
-        # context is None for linear attention (no cross-attention)
-        return hidden_states, None
+        # Second return value carries router_logits (for MoE aux loss) instead of context
+        return hidden_states, router_logits

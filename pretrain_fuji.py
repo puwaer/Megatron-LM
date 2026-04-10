@@ -22,7 +22,7 @@ from megatron.training import (
     pretrain
 )
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.utils import get_batch_on_this_tp_rank, is_first_or_last_pipeline_stage
+from megatron.training.utils import get_batch_on_this_tp_rank, is_first_or_last_pipeline_stage, average_losses_across_data_parallel_group
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.utils import StragglerDetector
@@ -180,8 +180,6 @@ def add_fuji_args(parser):
     # registered automatically via ArgumentGroupFactory(TransformerConfig) in
     # megatron/training/arguments.py. Re-registering them here would cause a conflict.
     return parser
-
-from megatron.training.utils import average_losses_across_data_parallel_group
 
 if __name__ == "__main__":
     pretrain(

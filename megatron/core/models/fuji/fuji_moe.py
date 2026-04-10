@@ -377,10 +377,9 @@ class FujiRoutedExperts(nn.Module):
         """Fallback Python-loop path (slow, but no extra dependency)."""
         output = torch.zeros_like(tokens)
 
-        with torch.no_grad():
-            expert_mask = F.one_hot(local_ids, self.num_local_experts)  # [N, E_local]
-            expert_mask = expert_mask.T                                   # [E_local, N]
-            active = expert_mask.any(dim=1).nonzero(as_tuple=False)
+        expert_mask = F.one_hot(local_ids, self.num_local_experts)  # [N, E_local]
+        expert_mask = expert_mask.T                                   # [E_local, N]
+        active = expert_mask.any(dim=1).nonzero(as_tuple=False)
 
         for row in active:
             eid = row[0].item()
