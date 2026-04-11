@@ -132,7 +132,8 @@ class FujiTopKRouter(nn.Module):
         self.moe_aux_loss_coeff = moe_aux_loss_coeff
         self.num_layers = num_layers
         self.layer_number: Optional[int] = None  # Set by FujiSparseMoE after construction
-        self.weight = nn.Parameter(torch.zeros(num_experts, hidden_size))
+        self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
+        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
 
     def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """Route tokens to experts.
@@ -168,8 +169,10 @@ class FujiTopKRouter(nn.Module):
             # Switch load-balancing loss: E * sum(f_i * P_i)
             aux_loss = self.num_experts * torch.dot(f, P) * self.moe_aux_loss_coeff
 
-            # Attach aux loss gradient to the hidden_states activation
-            hidden_states = MoEAuxLossAutoScaler.apply(hidden_states, aux_loss)
+            # Attach aux loss gradient to top_weights (which flows to expert
+            # computation and ultimately to the loss).  routing_probs is
+            # discarded by the decoder layer, so attaching there has no effect.
+            top_weights = MoEAuxLossAutoScaler.apply(top_weights, aux_loss)
 
             # Log to Megatron's aux loss tracker
             if self.layer_number is not None:
