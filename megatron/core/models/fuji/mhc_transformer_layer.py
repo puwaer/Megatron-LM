@@ -60,7 +60,6 @@ class MHCTransformerLayer(TransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        is_mtp_layer: bool = False,
         engram_module: Optional[EngramModule] = None,
     ) -> None:
         super().__init__(
@@ -70,7 +69,6 @@ class MHCTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
-            is_mtp_layer=is_mtp_layer,
         )
 
         # mHC module — created only when the feature is enabled

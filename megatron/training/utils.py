@@ -553,6 +553,15 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             ),
         }
 
+        def _broadcast_cu_seqlens(cu_seqlens):
+            dev = torch.cuda.current_device()
+            if cu_seqlens is not None:
+                n = torch.tensor(cu_seqlens.shape[-1], dtype=torch.int64, device=dev)
+            else:
+                n = torch.tensor(0, dtype=torch.int64, device=dev)
+            _broadcast(n)
+            _broadcast(cu_seqlens)
+
         if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])

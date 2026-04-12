@@ -64,6 +64,27 @@ class MHCSelectiveCheckpoint(torch.autograd.Function):
             grad_X:      Gradient w.r.t. X [n, S, B, D].
             grad_x_out:  Gradient w.r.t. x_out [S, B, D].
             None:        Gradient w.r.t. mhc_module (not differentiable).
+
+        Implementation note — why autograd.grad instead of backward():
+            MHCTransformerLayer with selective recompute uses mhc params in
+            TWO places:
+              1. _width_connection → branch_input (x_in) — kept in main graph
+              2. _width_connection/_depth_connection — run under no_grad in
+                 forward, recomputed here.
+
+            If we called X_next_r.backward(), PyTorch's AccumulateGrad would
+            fire the DDP backward-post-hook for each mHC param (1st time).
+            Later, the main backward traverses branch_input back through
+            _width_connection and AccumulateGrad fires again (2nd time) →
+            Megatron DDP asserts "Cannot set grad twice".
+
+            torch.autograd.grad() returns gradients WITHOUT calling
+            AccumulateGrad or any registered hooks. We then manually
+            accumulate the depth-connection gradients into param.grad. When
+            the main backward subsequently reaches the mHC params via the
+            branch_input path, AccumulateGrad fires exactly once (adding the
+            branch_input gradient on top of the depth-connection gradient
+            already in param.grad), and the DDP hook fires exactly once.
         """
         X, x_out = ctx.saved_tensors
         mhc_module = ctx.mhc_module
@@ -78,7 +99,32 @@ class MHCSelectiveCheckpoint(torch.autograd.Function):
             # Recompute depth connection
             X_next_r = mhc_module._depth_connection(x_out_d, new_residuals, beta)
 
-        # Backpropagate through the recomputed subgraph
-        X_next_r.backward(grad_X_next)
+        # Collect mHC parameters that participate in the depth-connection path.
+        mhc_params = [p for p in mhc_module.parameters() if p.requires_grad]
 
-        return X_d.grad, x_out_d.grad, None
+        # Compute gradients via autograd.grad (does NOT trigger AccumulateGrad
+        # or DDP backward-post-hooks on the mHC parameters).
+        all_inputs = [X_d, x_out_d] + mhc_params
+        all_grads = torch.autograd.grad(
+            outputs=X_next_r,
+            inputs=all_inputs,
+            grad_outputs=grad_X_next,
+            allow_unused=True,
+        )
+
+        grad_X = all_grads[0]
+        grad_x_out = all_grads[1]
+        param_grads = all_grads[2:]
+
+        # Accumulate depth-connection gradients into param.grad WITHOUT
+        # triggering AccumulateGrad.  When the main backward later reaches
+        # AccumulateGrad for these params (via the branch_input path), it will
+        # add the branch_input gradient on top, and the DDP hook fires once.
+        for param, grad in zip(mhc_params, param_grads):
+            if grad is not None:
+                if param.grad is not None:
+                    param.grad.add_(grad)
+                else:
+                    param.grad = grad.clone()
+
+        return grad_X, grad_x_out, None

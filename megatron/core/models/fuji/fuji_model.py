@@ -174,7 +174,6 @@ class FujiModel(GPTModel):
         *,
         inference_params=None,
         loss_mask: Optional[Tensor] = None,
-        padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward pass.
 
@@ -208,7 +207,6 @@ class FujiModel(GPTModel):
             runtime_gather_output=runtime_gather_output,
             inference_params=inference_params,
             loss_mask=loss_mask,
-            padding_mask=padding_mask,
         )
 
 
