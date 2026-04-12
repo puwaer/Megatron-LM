@@ -36,6 +36,32 @@ def fuji_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
     if config is None:
         config = core_transformer_config_from_args(args)
 
+    # Tensor-parallel divisibility pre-checks.  Megatron catches most of these
+    # internally, but failing fast here gives a clear actionable error before
+    # any module is constructed.
+    tp = args.tensor_model_parallel_size
+    if tp > 1:
+        assert args.num_attention_heads % tp == 0, (
+            f"num_attention_heads={args.num_attention_heads} must be divisible by TP={tp}")
+        assert args.num_query_groups % tp == 0, (
+            f"num_query_groups={args.num_query_groups} must be divisible by TP={tp}")
+        assert args.ffn_hidden_size % tp == 0, (
+            f"ffn_hidden_size={args.ffn_hidden_size} must be divisible by TP={tp}")
+        assert args.hidden_size % tp == 0, (
+            f"hidden_size={args.hidden_size} must be divisible by TP={tp}")
+        moe_ffn = getattr(args, 'moe_ffn_hidden_size', None)
+        if moe_ffn is not None:
+            assert moe_ffn % tp == 0, (
+                f"moe_ffn_hidden_size={moe_ffn} must be divisible by TP={tp}")
+        linear_k = getattr(args, 'linear_num_key_heads', None)
+        if linear_k is not None:
+            assert linear_k % tp == 0, (
+                f"linear_num_key_heads={linear_k} must be divisible by TP={tp}")
+        linear_v = getattr(args, 'linear_num_value_heads', None)
+        if linear_v is not None:
+            assert linear_v % tp == 0, (
+                f"linear_num_value_heads={linear_v} must be divisible by TP={tp}")
+
     # 1. Select the appropriate layer spec
     if args.transformer_impl == 'transformer_engine':
         transformer_layer_spec = get_fuji_layer_with_transformer_engine_spec(

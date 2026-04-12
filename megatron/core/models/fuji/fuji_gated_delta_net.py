@@ -28,6 +28,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core import parallel_state
+from megatron.core.tensor_parallel.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    set_tensor_model_parallel_attributes,
+)
+
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 except ImportError:
@@ -250,6 +257,7 @@ class FujiGatedDeltaNet(nn.Module):
     def __init__(self, config, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.config = config
         self.hidden_size = config.hidden_size
 
         # Attention head configuration (reuse linear_* fields from TransformerConfig)
@@ -263,35 +271,92 @@ class FujiGatedDeltaNet(nn.Module):
         self.act_name = getattr(config, 'hidden_act', 'silu')
         self.norm_eps = getattr(config, 'rms_norm_eps', 1e-6)
 
-        # Convolution operates on [key_dim*2 + value_dim] channels
-        self.conv_dim = self.key_dim * 2 + self.value_dim
+        # Tensor parallel sharding of heads.  Each rank owns a contiguous slice
+        # of num_k_heads and num_v_heads.  The ratio num_v_heads/num_k_heads
+        # is preserved under TP (both divide by the same factor).
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        assert self.num_k_heads % tp_size == 0, (
+            f"linear_num_key_heads ({self.num_k_heads}) must be divisible by "
+            f"tensor_model_parallel_size ({tp_size})"
+        )
+        assert self.num_v_heads % tp_size == 0, (
+            f"linear_num_value_heads ({self.num_v_heads}) must be divisible by "
+            f"tensor_model_parallel_size ({tp_size})"
+        )
+        self.tp_size           = tp_size
+        self.num_k_heads_local = self.num_k_heads // tp_size
+        self.num_v_heads_local = self.num_v_heads // tp_size
+        self.key_dim_local     = self.num_k_heads_local * self.k_head_dim
+        self.value_dim_local   = self.num_v_heads_local * self.v_head_dim
+
+        # Convolution operates on [Q | K | V] channels — each sharded per rank.
+        # The full (TP=1) channel layout is [key_dim | key_dim | value_dim]; under
+        # TP, each rank holds the slice [key_dim_local | key_dim_local | value_dim_local]
+        # corresponding to its head range.  The single nn.Parameter keeps this local
+        # layout; _load_from_fuji_gated_delta_net_state_dict below slices a full
+        # checkpoint into the correct non-contiguous pieces.
+        self.conv_dim       = self.key_dim * 2 + self.value_dim
+        self.conv_dim_local = self.key_dim_local * 2 + self.value_dim_local
         self.conv1d = nn.Conv1d(
-            self.conv_dim, self.conv_dim,
+            self.conv_dim_local, self.conv_dim_local,
             kernel_size=self.conv_kernel,
             padding=self.conv_kernel - 1,
-            groups=self.conv_dim,
+            groups=self.conv_dim_local,
             bias=False,
         )
+        # conv1d.weight stays marked as the Megatron default (non-parallel).
+        # The channel layout is non-contiguously sharded ([Q|K|V] blocks, each
+        # sliced per rank), so Megatron's standard dim-0 sharding cannot describe
+        # it.  The pre-load hook below slices a full (TP=1) checkpoint into the
+        # correct local layout; within-TP resume works directly because the
+        # saved per-rank shape already matches the local parameter shape.
 
-        # Input projections
+        # Input projections (TP: column-sharded along output dim, head-aligned)
         proj_qkvz = self.key_dim * 2 + self.value_dim * 2
         proj_ba   = self.num_v_heads * 2
-        self.in_proj_qkvz = nn.Linear(self.hidden_size, proj_qkvz, bias=False)
-        self.in_proj_ba   = nn.Linear(self.hidden_size, proj_ba,   bias=False)
+        self.in_proj_qkvz = ColumnParallelLinear(
+            self.hidden_size, proj_qkvz,
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            gather_output=False,
+            skip_bias_add=True,
+        )
+        self.in_proj_ba = ColumnParallelLinear(
+            self.hidden_size, proj_ba,
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            gather_output=False,
+            skip_bias_add=True,
+        )
 
-        # Learnable time-step and decay parameters.
+        # Learnable time-step and decay parameters (per-v-head, sharded along v-heads).
         # A ~ U[0.001, 0.016] → per-step g ≈ -0.007, cumsum(64) ≈ -0.45,
         # exp(-0.45) ≈ 0.64: healthy cross-chunk state decay.
-        # (Previously A ~ U[0, 16] → cumsum(64) ≈ -672, exp(-672) ≈ 0: state zeroed.)
-        self.dt_bias = nn.Parameter(torch.zeros(self.num_v_heads))
-        A = torch.empty(self.num_v_heads).uniform_(0.001, 0.016)
+        self.dt_bias = nn.Parameter(torch.zeros(self.num_v_heads_local))
+        A = torch.empty(self.num_v_heads_local).uniform_(0.001, 0.016)
         self.A_log  = nn.Parameter(A.log())
+        set_tensor_model_parallel_attributes(self.dt_bias, is_parallel=True, dim=0, stride=1)
+        set_tensor_model_parallel_attributes(self.A_log,   is_parallel=True, dim=0, stride=1)
 
-        # Output normalisation (RMSNorm + gating)
+        # Output normalisation (RMSNorm + gating) — replicated per v-head dim.
         self.norm = _RMSNormGated(self.v_head_dim, eps=self.norm_eps)
 
-        # Output projection
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        # Output projection (TP: row-sharded along input dim; all-reduces the output)
+        self.out_proj = RowParallelLinear(
+            self.value_dim, self.hidden_size,
+            config=config,
+            init_method=config.output_layer_init_method,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=True,
+        )
+
+        # Register a load hook so TP=1 checkpoints load correctly into TP>1 shards
+        # (and vice versa for conv1d + dt_bias + A_log).  ColumnParallelLinear and
+        # RowParallelLinear already handle their own sharded loading.
+        self._register_load_state_dict_pre_hook(self._slice_tp_params_on_load, with_module=True)
 
         # Select compute kernels
         self._causal_conv1d_update = causal_conv1d_update or _torch_causal_conv1d_update
@@ -300,33 +365,97 @@ class FujiGatedDeltaNet(nn.Module):
         self._recur_fn  = fused_recurrent_gated_delta_rule or _recurrent_gated_delta_rule
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Checkpoint compatibility (TP-size-agnostic loading for non-parallel-linear
+    # parameters: conv1d.weight, dt_bias, A_log).  ColumnParallelLinear and
+    # RowParallelLinear already handle their own weights via Megatron's standard
+    # dist-checkpointing path.
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _slice_tp_params_on_load(
+        module,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        tp_size = module.tp_size
+        if tp_size == 1:
+            return
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
+        # --- dt_bias / A_log: contiguous shard along dim 0 (num_v_heads) -----
+        for name in ("dt_bias", "A_log"):
+            key = prefix + name
+            if key not in state_dict:
+                continue
+            saved = state_dict[key]
+            param = getattr(module, name)
+            if saved.shape == param.shape:
+                continue  # already correctly sharded
+            if saved.shape[0] == module.num_v_heads:
+                start = tp_rank * module.num_v_heads_local
+                end   = start + module.num_v_heads_local
+                state_dict[key] = saved[start:end].clone()
+            else:
+                error_msgs.append(
+                    f"{key}: cannot reconcile saved shape {tuple(saved.shape)} "
+                    f"with local shape {tuple(param.shape)}"
+                )
+
+        # --- conv1d.weight: non-contiguous [Q|K|V] slice along dim 0 ---------
+        key = prefix + "conv1d.weight"
+        if key in state_dict:
+            saved = state_dict[key]
+            param = module.conv1d.weight
+            if saved.shape != param.shape:
+                # Saved layout: [key_dim | key_dim | value_dim, 1, kernel]
+                # Local slice: [Q_local, K_local, V_local] concatenated.
+                q_start = tp_rank * module.key_dim_local
+                q_end   = q_start + module.key_dim_local
+                k_base  = module.key_dim
+                v_base  = module.key_dim * 2
+                v_start = tp_rank * module.value_dim_local
+                v_end   = v_start + module.value_dim_local
+                try:
+                    w_q = saved[q_start:q_end]
+                    w_k = saved[k_base + q_start : k_base + q_end]
+                    w_v = saved[v_base + v_start : v_base + v_end]
+                    state_dict[key] = torch.cat([w_q, w_k, w_v], dim=0).clone()
+                except Exception as exc:
+                    error_msgs.append(f"{key}: TP slicing failed: {exc}")
 
     def _split_qkvz_ba(
         self, qkvz: Tensor, ba: Tensor
     ):
-        """Split projected tensors into Q, K, V, Z, beta, alpha."""
+        """Split projected tensors into Q, K, V, Z, beta, alpha (per-rank shard).
+
+        Operates on the TP-local slice: num_k_heads_local k-heads and
+        num_v_heads_local v-heads on this rank.  ``ratio`` is preserved across
+        TP sizes because both key and value head counts are divisible by TP.
+        """
         B, S, _ = qkvz.shape
-        # Reshape to [B, S, num_k_heads, per_head_dim]
+        ratio = self.num_v_heads // self.num_k_heads  # preserved under TP
+        # Reshape to [B, S, num_k_heads_local, per_head_dim]
         per_head = (
-            self.k_head_dim,               # Q
-            self.k_head_dim,               # K
-            self.num_v_heads // self.num_k_heads * self.v_head_dim,   # V
-            self.num_v_heads // self.num_k_heads * self.v_head_dim,   # Z
+            self.k_head_dim,                  # Q
+            self.k_head_dim,                  # K
+            ratio * self.v_head_dim,          # V
+            ratio * self.v_head_dim,          # Z
         )
-        qkvz = qkvz.view(B, S, self.num_k_heads, sum(per_head))
+        qkvz = qkvz.view(B, S, self.num_k_heads_local, sum(per_head))
         q, k, v, z = qkvz.split(list(per_head), dim=-1)
-        # Reshape V and Z to [B, S, num_v_heads, v_head_dim]
-        ratio = self.num_v_heads // self.num_k_heads
         v = v.reshape(B, S, -1, self.v_head_dim)
         z = z.reshape(B, S, -1, self.v_head_dim)
 
         per_ba = (ratio, ratio)
-        ba = ba.view(B, S, self.num_k_heads, sum(per_ba))
+        ba = ba.view(B, S, self.num_k_heads_local, sum(per_ba))
         b, a = ba.split(list(per_ba), dim=-1)
-        b = b.reshape(B, S, self.num_v_heads)
-        a = a.reshape(B, S, self.num_v_heads)
+        b = b.reshape(B, S, self.num_v_heads_local)
+        a = a.reshape(B, S, self.num_v_heads_local)
         return q, k, v, z, b, a
 
     # ------------------------------------------------------------------
@@ -351,14 +480,25 @@ class FujiGatedDeltaNet(nn.Module):
         Returns:
             output: [S, B, D]
         """
-        # Megatron [S, B, D] → batch-first [B, S, D]
-        hidden_states = hidden_states.transpose(0, 1)  # [B, S, D]
-        B, S, D = hidden_states.shape
+        # Input is [S, B, D] in Megatron convention.  Apply the column-parallel
+        # projections while still in seq-first layout so sequence_parallel works.
+        S, B, D = hidden_states.shape
 
-        # Zero-out padding tokens (matches Qwen3-Next's apply_mask_to_padding_states)
+        # Zero-out padding tokens (matches Qwen3-Next's apply_mask_to_padding_states).
+        # attention_mask is [B, S]; we apply it in seq-first form.
         if attention_mask is not None and attention_mask.shape[1] > 1 and B > 1:
             dtype = hidden_states.dtype
-            hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+            mask_sb = attention_mask.transpose(0, 1).unsqueeze(-1)  # [S, B, 1]
+            hidden_states = (hidden_states * mask_sb).to(dtype)
+
+        # Project input (ColumnParallelLinear returns (output, bias_or_None)).
+        qkvz, _ = self.in_proj_qkvz(hidden_states)  # [S, B, proj_qkvz_local]
+        ba,   _ = self.in_proj_ba(hidden_states)    # [S, B, proj_ba_local]
+
+        # Switch to batch-first [B, S, *] for the kernel path.
+        qkvz = qkvz.transpose(0, 1).contiguous()
+        ba   = ba.transpose(0, 1).contiguous()
+        B, S = qkvz.shape[0], qkvz.shape[1]
 
         is_inference_step = (
             inference_cache is not None
@@ -366,16 +506,13 @@ class FujiGatedDeltaNet(nn.Module):
             and S == 1
         )
 
-        # Project input
-        qkvz = self.in_proj_qkvz(hidden_states)   # [B, S, proj_qkvz]
-        ba   = self.in_proj_ba(hidden_states)      # [B, S, proj_ba]
         q, k, v, z, b, a = self._split_qkvz_ba(qkvz, ba)
 
-        # Flatten Q, K, V to channel dimension for conv1d: [B, S, conv_dim]
+        # Flatten Q, K, V to channel dimension for conv1d: [B, S, conv_dim_local]
         q_flat = q.reshape(B, S, -1)
         k_flat = k.reshape(B, S, -1)
         v_flat = v.reshape(B, S, -1)
-        mixed_qkv = torch.cat([q_flat, k_flat, v_flat], dim=-1).transpose(1, 2)  # [B, conv_dim, S]
+        mixed_qkv = torch.cat([q_flat, k_flat, v_flat], dim=-1).transpose(1, 2)  # [B, conv_dim_local, S]
 
         # Causal convolution
         if is_inference_step:
@@ -401,13 +538,15 @@ class FujiGatedDeltaNet(nn.Module):
             else:
                 mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :S])
 
-        mixed_qkv = mixed_qkv.transpose(1, 2)  # [B, S, conv_dim]
+        mixed_qkv = mixed_qkv.transpose(1, 2)  # [B, S, conv_dim_local]
         q_flat, k_flat, v_flat = torch.split(
-            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+            mixed_qkv,
+            [self.key_dim_local, self.key_dim_local, self.value_dim_local],
+            dim=-1,
         )
-        q = q_flat.reshape(B, S, self.num_k_heads, self.k_head_dim)
-        k = k_flat.reshape(B, S, self.num_k_heads, self.k_head_dim)
-        v = v_flat.reshape(B, S, self.num_v_heads, self.v_head_dim)
+        q = q_flat.reshape(B, S, self.num_k_heads_local, self.k_head_dim)
+        k = k_flat.reshape(B, S, self.num_k_heads_local, self.k_head_dim)
+        v = v_flat.reshape(B, S, self.num_v_heads_local, self.v_head_dim)
 
         # Beta and decay (g)
         beta = b.sigmoid()
@@ -438,14 +577,14 @@ class FujiGatedDeltaNet(nn.Module):
         if inference_cache is not None and final_state is not None:
             inference_cache.recurrent_state = final_state
 
-        # Output normalisation: flatten [B, S, H, v_head_dim] → [B*S, H*v_head_dim]
+        # Output normalisation: flatten [B, S, H_local, v_head_dim] → [B*S, local v_head_dim slice]
         z_shape = z.shape
         core_out = core_out.reshape(-1, core_out.shape[-1])
         z_flat   = z.reshape(-1, z.shape[-1])
         core_out = self.norm(core_out, z_flat)
-        core_out = core_out.reshape(z_shape[0], z_shape[1], -1)  # [B, S, value_dim]
+        core_out = core_out.reshape(z_shape[0], z_shape[1], -1)  # [B, S, value_dim_local]
 
-        output = self.out_proj(core_out)  # [B, S, D]
-
-        # Back to Megatron [S, B, D]
-        return output.transpose(0, 1)
+        # Back to Megatron [S, B, value_dim_local] before the row-parallel out_proj.
+        core_out = core_out.transpose(0, 1).contiguous()
+        output, _ = self.out_proj(core_out)  # [S, B, hidden_size] (TP-reduced)
+        return output

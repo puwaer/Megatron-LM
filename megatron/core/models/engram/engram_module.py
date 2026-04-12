@@ -21,8 +21,12 @@ Tensor parallel notes:
   - NgramHashMapping: replicated (deterministic, no weights)
   - MultiHeadEmbedding: replicated in this implementation; future work can shard
     via VocabParallelEmbedding for very large tables
-  - ShortConv / gate_proj / out_proj: replicated; out_proj uses RowParallelLinear
-    when TP > 1 to keep the output consistent with the rest of the hidden state
+  - ShortConv / head_proj / gate_proj / out_proj: replicated across TP ranks,
+    with initial weights broadcast from the TP src rank and the Megatron
+    ``tensor_model_parallel=False`` attribute set so the optimiser averages
+    gradients across the TP group.  This keeps the weights byte-identical on
+    every TP rank and avoids any sequence-parallel scatter coupling inside
+    Engram (whose forward operates on full-length [B, S, D]).
 """
 
 import unicodedata
@@ -31,10 +35,15 @@ from functools import reduce
 from typing import List, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core import parallel_state
+from megatron.core.tensor_parallel import (
+    set_defaults_if_not_set_tensor_model_parallel_attributes,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -415,6 +424,36 @@ class EngramModule(nn.Module):
         # --- Output projection: n_embed_dim → hidden_size ---
         self.out_proj = nn.Linear(config.n_embed_dim, hidden_size, bias=False)
         nn.init.zeros_(self.out_proj.weight)  # zero-init: Engram starts as identity
+
+        # --- Tensor-parallel bookkeeping ---
+        # Engram's linears are replicated across TP (see module docstring).
+        # 1. Mark weights as non-TP-parallel so the dist-checkpoint path treats
+        #    them as replicated, and the optimiser averages their gradients
+        #    across the TP group.
+        # 2. Broadcast the freshly-initialised weights from the TP src rank so
+        #    every rank in the TP group starts byte-identical (otherwise the
+        #    default randomised inits of head_proj / gate_proj would diverge).
+        for param in (
+            self.head_proj.weight,
+            self.gate_proj.weight,
+            self.out_proj.weight,
+        ):
+            set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        if tp_size > 1 and dist.is_available() and dist.is_initialized():
+            src = parallel_state.get_tensor_model_parallel_src_rank()
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            with torch.no_grad():
+                for param in (
+                    self.head_proj.weight,
+                    self.gate_proj.weight,
+                    self.out_proj.weight,
+                    self.short_conv.conv.weight,
+                    self.short_conv.conv.bias,
+                ):
+                    if param is not None:
+                        dist.broadcast(param.data, src=src, group=tp_group)
 
     def forward(self, input_ids: Tensor, hidden_states: Tensor) -> Tensor:
         """Compute the Engram memory increment.

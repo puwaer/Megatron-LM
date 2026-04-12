@@ -40,6 +40,7 @@ from megatron.core.models.engram.engram_module import EngramConfig, EngramModule
 from megatron.core.models.fuji.mhc_transformer_layer import MHCTransformerLayer
 from megatron.core.models.fuji.fuji_hybrid_decoder_layer import FujiLinearAttentionDecoderLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.transformer_block import (
     LayerNormImpl,
     TransformerBlock,
@@ -179,17 +180,37 @@ class FujiBlock(TransformerBlock):
         # mHC stream-collapse projection: [n*D] → [D]
         # Initialised to equal-weight average so that at start of training the
         # collapsed output equals the embedding (all n streams start identical).
-        self.stream_proj: Optional[nn.Linear] = None
+        # Sharded across TP on the D output dim; gather_output=True so the
+        # collapsed hidden state is fully replicated for the next layer.
+        self.stream_proj: Optional[ColumnParallelLinear] = None
         if getattr(config, 'use_mhc', False):
             n = config.mhc_num_streams
             D = config.hidden_size
-            self.stream_proj = nn.Linear(n * D, D, bias=False)
+            self.stream_proj = ColumnParallelLinear(
+                n * D,
+                D,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                gather_output=True,
+                skip_bias_add=True,
+            )
             with torch.no_grad():
-                # Each D-dim output = mean of the corresponding D-dim slice from each stream
-                w = torch.zeros(D, n * D)
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                assert D % tp_size == 0, (
+                    f"hidden_size={D} must be divisible by TP={tp_size} for stream_proj"
+                )
+                D_local = D // tp_size
+                row_start = tp_rank * D_local
+                row_end = row_start + D_local
+                w_full = torch.zeros(D, n * D)
                 for s in range(n):
-                    w[:, s * D:(s + 1) * D] = torch.eye(D) / n
-                self.stream_proj.weight.copy_(w)
+                    w_full[:, s * D:(s + 1) * D] = torch.eye(D) / n
+                w_local = w_full[row_start:row_end]
+                self.stream_proj.weight.copy_(
+                    w_local.to(self.stream_proj.weight.device)
+                )
 
         # Attach Engram modules to the appropriate layers
         if engram_config is not None and getattr(config, 'use_engram', False):
@@ -310,7 +331,7 @@ class FujiBlock(TransformerBlock):
             S, B, D = h.shape[1], h.shape[2], h.shape[3]
             # Permute to [S, B, n, D] then flatten to [S, B, n*D]
             h = h.permute(1, 2, 0, 3).contiguous().reshape(S, B, n_actual * D)
-            h = self.stream_proj(h)  # [S, B, D]
+            h, _bias = self.stream_proj(h)  # [S, B, D]
 
             if extra is not None:
                 return (h,) + extra

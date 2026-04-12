@@ -29,6 +29,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.tensor_parallel.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    set_defaults_if_not_set_tensor_model_parallel_attributes,
+)
+
 try:
     from megatron.core import parallel_state as _parallel_state
     _HAVE_PARALLEL_STATE = True
@@ -83,16 +89,47 @@ def _get_ep_info():
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _SwiGLUMLP(nn.Module):
-    """Standard SwiGLU MLP used for both shared and routed experts."""
+    """Standard SwiGLU MLP used for the shared expert and the dense fallback.
 
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    Tensor-parallel:
+      gate_proj / up_proj are column-parallel (output dim sharded across TP).
+      down_proj is row-parallel (input dim sharded, output all-reduced).
+      intermediate_size must be divisible by the TP size.
+    """
+
+    def __init__(self, hidden_size: int, intermediate_size: int, config) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj   = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj  = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = ColumnParallelLinear(
+            hidden_size, intermediate_size,
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            gather_output=False,
+            skip_bias_add=True,
+        )
+        self.up_proj = ColumnParallelLinear(
+            hidden_size, intermediate_size,
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            gather_output=False,
+            skip_bias_add=True,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size, hidden_size,
+            config=config,
+            init_method=config.output_layer_init_method,
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=True,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        # ColumnParallelLinear / RowParallelLinear return (output, bias_or_None).
+        gate, _ = self.gate_proj(x)
+        up,   _ = self.up_proj(x)
+        out,  _ = self.down_proj(F.silu(gate) * up)
+        return out
 
 
 class FujiTopKRouter(nn.Module):
@@ -121,6 +158,7 @@ class FujiTopKRouter(nn.Module):
         num_experts: int,
         num_experts_per_tok: int,
         hidden_size: int,
+        config,
         norm_topk_prob: bool = True,
         moe_aux_loss_coeff: float = 0.0,
         num_layers: int = 1,
@@ -132,8 +170,21 @@ class FujiTopKRouter(nn.Module):
         self.moe_aux_loss_coeff = moe_aux_loss_coeff
         self.num_layers = num_layers
         self.layer_number: Optional[int] = None  # Set by FujiSparseMoE after construction
-        self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
-        nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
+
+        # Router is column-sharded across TP but must emit the full num_experts
+        # logits so top-k sees every expert.  gather_output=True all-gathers the
+        # [..., num_experts/TP] local slice into [..., num_experts].
+        def _router_init(tensor):
+            nn.init.kaiming_uniform_(tensor, a=5 ** 0.5)
+
+        self.gate_linear = ColumnParallelLinear(
+            hidden_size, num_experts,
+            config=config,
+            init_method=_router_init,
+            bias=False,
+            gather_output=True,
+            skip_bias_add=True,
+        )
 
     def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """Route tokens to experts.
@@ -146,7 +197,11 @@ class FujiTopKRouter(nn.Module):
             routing_weights: [T, top_k]        — selected and optionally normalised weights.
             selected_experts:[T, top_k]        — expert indices (long).
         """
-        routing_probs = F.softmax(F.linear(hidden_states, self.weight), dim=-1, dtype=torch.float)
+        # Reshape to [T, 1, D] so the parallel linear's [seq, batch, hidden]
+        # contract is satisfied, then squeeze back to [T, num_experts].
+        logits_sbh, _ = self.gate_linear(hidden_states.unsqueeze(1))
+        logits = logits_sbh.squeeze(1)
+        routing_probs = F.softmax(logits, dim=-1, dtype=torch.float)
         top_weights, top_indices = torch.topk(routing_probs, self.top_k, dim=-1)
         if self.norm_topk_prob:
             top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-6)
@@ -672,6 +727,7 @@ class FujiSparseMoE(nn.Module):
             num_experts=num_experts,
             num_experts_per_tok=num_experts_tok,
             hidden_size=hidden,
+            config=config,
             norm_topk_prob=norm_topk,
             moe_aux_loss_coeff=aux_loss_coeff,
             num_layers=num_layers,
@@ -682,8 +738,27 @@ class FujiSparseMoE(nn.Module):
             hidden_size=hidden,
             intermediate_size=moe_inter,
         )
-        self.shared_expert      = _SwiGLUMLP(hidden, shared_inter)
+        self.shared_expert      = _SwiGLUMLP(hidden, shared_inter, config=config)
+        # The shared-expert gate produces a single scalar logit per token and
+        # cannot be column-sharded (1 / TP < 1).  Keep it replicated: mark the
+        # weight with the default (non-parallel) TP attributes and broadcast
+        # from TP rank 0 so every rank starts identically.  Megatron's
+        # optimizer will sync gradients inside the TP group via the standard
+        # replicated-parameter path.
         self.shared_expert_gate = nn.Linear(hidden, 1, bias=False)
+        set_defaults_if_not_set_tensor_model_parallel_attributes(
+            self.shared_expert_gate.weight
+        )
+        if _HAVE_PARALLEL_STATE:
+            try:
+                tp_group = _parallel_state.get_tensor_model_parallel_group()
+                if dist.is_initialized() and tp_group is not None:
+                    src = _parallel_state.get_tensor_model_parallel_src_rank()
+                    dist.broadcast(
+                        self.shared_expert_gate.weight.data, src=src, group=tp_group
+                    )
+            except Exception:
+                pass
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Sharded state dict for dist_checkpointing.
@@ -746,7 +821,7 @@ class FujiDenseMLP(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         inter = getattr(config, 'ffn_hidden_size', None) or 4 * config.hidden_size
-        self.mlp = _SwiGLUMLP(config.hidden_size, inter)
+        self.mlp = _SwiGLUMLP(config.hidden_size, inter, config=config)
 
     def forward(self, hidden_states: Tensor) -> Tuple[Tensor, None]:
         S, B, D = hidden_states.shape
