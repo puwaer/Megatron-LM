@@ -41,6 +41,7 @@ from megatron.core.models.fuji.mhc_transformer_layer import MHCTransformerLayer
 from megatron.core.models.fuji.fuji_hybrid_decoder_layer import FujiLinearAttentionDecoderLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_block import (
+    LayerNormImpl,
     TransformerBlock,
     TransformerBlockSubmodules,
     get_num_layers_to_build,
@@ -91,6 +92,16 @@ class FujiBlock(TransformerBlock):
             # Determine hybrid pattern (default: one full attention every 4 layers)
             full_interval = getattr(config, 'full_attention_interval', 4)
 
+            # Preserve the original block-level layer_norm so that the parent
+            # TransformerBlock still constructs ``final_layernorm`` on the last
+            # PP stage.  Without this, reconstructing ``TransformerBlockSubmodules``
+            # below would drop ``layer_norm`` and the trained checkpoint would be
+            # missing ``decoder.final_layernorm.weight``.
+            if isinstance(spec, TransformerBlockSubmodules):
+                original_layer_norm = spec.layer_norm
+            else:
+                original_layer_norm = LayerNormImpl
+
             # Convert input spec to a list of specs (one per layer)
             if isinstance(spec, TransformerBlockSubmodules):
                 if spec.layer_specs is None:
@@ -140,8 +151,12 @@ class FujiBlock(TransformerBlock):
                         params={"mlp_only": mlp_only},
                     )
 
-            # Update spec to use the new per-layer specs
-            spec = TransformerBlockSubmodules(layer_specs=layer_specs)
+            # Update spec to use the new per-layer specs.  Carry layer_norm
+            # over so the parent block keeps the final layernorm builder.
+            spec = TransformerBlockSubmodules(
+                layer_specs=layer_specs,
+                layer_norm=original_layer_norm,
+            )
 
         # Auto-compute optimal recompute_num_layers (L_r*) when requested.
         # L_r* = round(sqrt(n * L / (n + 2))) minimises peak transient memory
