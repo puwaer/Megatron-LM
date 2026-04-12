@@ -171,24 +171,16 @@ def clip_grad_by_total_norm_fp32(
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
-        if not grads:
-            return
-        if any(g.dtype != torch.float32 for g in grads):
-            # multi_tensor_scale_cuda only supports FP32; fall back to PyTorch native scaling.
-            for g in grads:
-                g.mul_(clip_coeff)
-        else:
-            dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
-            multi_tensor_applier(
-                multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
-            )
+        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+        multi_tensor_applier(
+            multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+        )
 
 
 def count_zeros_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     grad_stats_parallel_group: torch.distributed.ProcessGroup,
     use_decoupled_grad: bool = False,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> float:
     """Counts the number of zeros in gradients associated with the passed-in list of
     parameters.
@@ -226,7 +218,7 @@ def count_zeros_fp32(
         grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
         grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
         is_not_shared = param_is_not_shared(param)
-        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
+        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
         if grad_not_none and is_not_shared and is_not_tp_duplicate:
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)

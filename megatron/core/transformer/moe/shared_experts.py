@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from copy import copy
+from copy import deepcopy
 from typing import Optional
 
 import torch
@@ -20,7 +20,6 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
@@ -44,7 +43,7 @@ class SharedExpertMLP(MLP):
         gate: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        config = copy(config)
+        config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
@@ -63,11 +62,9 @@ class SharedExpertMLP(MLP):
         else:
             self.gate_weight = None
 
-        if (
-            self.config.fp8
-            and self.config.fp8_recipe != 'delayed'
-            and is_te_min_version("2.6.0dev0")
-        ) or (self.config.fp4 and is_te_min_version("2.7.0.dev0")):
+        if (self.config.fp8 and is_te_min_version("2.6.0dev0")) or (
+            self.config.fp4 and is_te_min_version("2.7.0.dev0")
+        ):
             # For fp8/fp4 training, the output of pre_mlp_layernorm is saved by router, and
             # the shared expert linear_fc1 also saves the quantized tensor of this output.
             # Here we set the linear_fc1 to save the original input tensors to avoid the extra
@@ -123,7 +120,7 @@ class SharedExpertMLP(MLP):
             if self.stream is None:
                 self.stream = torch.cuda.Stream()
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states):
         """Forward function"""
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
@@ -185,9 +182,7 @@ class SharedExpertMLP(MLP):
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         with torch.cuda.stream(self.stream):
             # [s, b, 4 * h/p]
-            intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
-                self.cached_fc1_input
-            )
+            intermediate_parallel, bias_parallel = self.linear_fc1(self.cached_fc1_input)
             self.cached_fc1_input = None
 
             if self.config.use_te_activation_func:
@@ -238,7 +233,7 @@ class SharedExpertMLP(MLP):
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         with torch.cuda.stream(self.stream):
             # [s, b, h]
-            self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
+            self.cached_fc2_output, _ = self.linear_fc2(self.cached_fc2_input)
             self.cached_fc2_input = None
 
     def post_forward_comm(self):

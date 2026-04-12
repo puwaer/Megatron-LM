@@ -2,20 +2,6 @@
 
 """Pretrain and SFT GPT."""
 
-# Capture the true program start time BEFORE any heavy imports.
-import time
-_PROGRAM_START_TIME = time.time()
-
-import json
-
-# Suppress warnings on all ranks but rank 0.
-import os
-import warnings
-rank = int(os.environ.get('RANK', 0))
-if rank != 0:
-    warnings.filterwarnings("ignore", category=UserWarning)
-    warnings.filterwarnings("ignore", category=FutureWarning)
-
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -28,19 +14,12 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
-from megatron.training import (
-    get_args,
-    get_timers,
-    inprocess_restart,
-    pretrain,
-    print_rank_0,
-    set_startup_timestamps,
-)
-from megatron.training.datasets.sft_dataset import SFTDataset
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
+from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training import get_args, get_timers, get_tokenizer, inprocess_restart, pretrain, print_rank_0
+from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -68,7 +47,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None, None
+        return None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -76,24 +55,10 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
         )
 
-    cu_seqlens = batch.pop('cu_seqlens', None)
-    cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
-    max_seqlen = batch.pop('max_seqlen', None)
-    local_cp_size = batch.pop('local_cp_size', None)
-    if local_cp_size is not None:
-        local_cp_size = int(local_cp_size.item())
+    # slice batch along sequence dimension for context parallelism
+    batch = get_batch_on_this_cp_rank(batch)
 
-    if cu_seqlens is None and local_cp_size is None:
-        # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
-        packed_seq_params = None
-    elif local_cp_size is None:  # Packed THD format
-        assert max_seqlen.dim() == 1
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
-    else: # Hybrid CP format
-        batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-    
-    return (*batch.values(), packed_seq_params)
+    return batch.values()
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -178,7 +143,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:
@@ -194,7 +159,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -211,17 +176,15 @@ def is_dataset_built_on_rank(vp_stage=None):
 
 
 def core_gpt_dataset_config_from_args(args):
-    tokenizer = build_tokenizer(args)
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
     blend, blend_per_split = get_blend_and_blend_per_split(args)
-
-    sequences_per_dataset = None
-    if args.per_dataset_sequences_path is not None:
-        with open(args.per_dataset_sequences_path, "r") as f:
-            sequences_per_dataset = json.load(f)
 
     data_args = {
         "random_seed": args.seed,
@@ -242,13 +205,6 @@ def core_gpt_dataset_config_from_args(args):
         "object_storage_cache_path": args.object_storage_cache_path,
         "mid_level_dataset_surplus": args.mid_level_dataset_surplus,
         "allow_ambiguous_pad_tokens": args.allow_ambiguous_pad_tokens,
-        "fast_cache_load": args.dataloader_fast_cache_load,
-        "sequences_per_dataset": sequences_per_dataset,
-        "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
-        "context_parallel_size": args.context_parallel_size,
-        "data_parallel_size": args.data_parallel_size,
-        "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
     }
 
     # add FIM args to the config
@@ -323,11 +279,6 @@ def get_embedding_ranks(pp_ranks: List[int]):
 
 
 if __name__ == "__main__":
-    # Timestamp right after entering __main__ block (after all imports/library setup)
-    _MAIN_ENTRY_TIME = time.time()
-
-    # Register startup timestamps for timing report in pretrain()
-    set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True

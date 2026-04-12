@@ -50,8 +50,7 @@ def expand_pattern(pattern):
 
 def main():
     BUCKET = sys.argv[1]
-    GPU_TYPE = sys.argv[2]
-    YAML_FILE = f'tests/test_utils/recipes/{GPU_TYPE}/unit-tests.yaml'
+    YAML_FILE = 'tests/test_utils/recipes/unit-tests.yaml'
 
     all_test_cases = get_test_cases(YAML_FILE)
     bucket_files = set(expand_pattern(BUCKET))

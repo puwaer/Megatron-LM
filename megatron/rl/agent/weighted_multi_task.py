@@ -66,9 +66,7 @@ class WeightedMultiTask(
                 self.weights.append(config.weight / total_weight)
 
     @classmethod
-    def from_config(
-        cls, config: list[dict[str, Any]], *, parallel_generation_tasks: int | None = None
-    ) -> 'WeightedMultiTask':
+    def from_config(cls, config: list[dict[str, Any]]) -> 'WeightedMultiTask':
         """Create a WeightedMultiTask from a config list.
 
         Args:
@@ -84,15 +82,13 @@ class WeightedMultiTask(
         for entry in config:
             if not all(k in entry for k in ['agent_type', 'agent_args', 'weight']):
                 raise ValueError(f"Missing required keys in config entry: {entry}")
-            agent_args = entry.get('agent_args', {})
-            agent_args['parallel_generation_tasks'] = parallel_generation_tasks
 
             # Import and instantiate the agent class
             agent_type = import_class(entry['agent_type'])
             agent_configs.append(
                 AgentConfig(
                     agent_type=agent_type,
-                    agent_args=agent_args,
+                    agent_args=entry['agent_args'],
                     weight=float(entry['weight']),
                     evaluation_only=entry.get('evaluation_only', False),
                 )

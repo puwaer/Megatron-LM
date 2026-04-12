@@ -1,12 +1,10 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-
 import os
 import torch
 from torch.optim import Adam
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Iterator
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple, Iterator
+from typing import Callable, Dict, Tuple
 
 from megatron.core import parallel_state
 from megatron.core import dist_checkpointing
@@ -20,10 +18,10 @@ from megatron.core.datasets.blended_megatron_dataset_builder import (
     BlendedMegatronDatasetBuilder,
 )
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.training.tokenizer.tokenizer import _NullTokenizer
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
-from megatron.core.tokenizers import MegatronTokenizer
 
 
 _SEQUENCE_LENGTH: int = 64
@@ -42,14 +40,10 @@ def initialize_distributed(
     parallel_state.destroy_model_parallel()
 
     # Torch setup for distributed training
-    rank: int = int(os.environ["RANK"])
-    world_size: int = int(os.environ["WORLD_SIZE"])
-    local_rank: int = int(os.environ["LOCAL_RANK"])
-
-    torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size
-    )
+    rank: int = int(os.environ["LOCAL_RANK"])
+    world_size: int = torch.cuda.device_count()
+    torch.cuda.set_device(rank)
+    torch.distributed.init_process_group(world_size=world_size, rank=rank)
 
     # Megatron core distributed training initialization
     parallel_state.initialize_model_parallel(
@@ -102,10 +96,7 @@ def get_train_data_iterator() -> Iterator:
         reset_position_ids=False,
         reset_attention_mask=False,
         eod_mask_loss=False,
-        tokenizer=MegatronTokenizer.from_pretrained(
-            metadata_path={"library": "null-text"},
-            vocab_size=_SEQUENCE_LENGTH,
-        ),
+        tokenizer=_NullTokenizer(vocab_size=_SEQUENCE_LENGTH),
         mid_level_dataset_surplus=0.005,
     )
 

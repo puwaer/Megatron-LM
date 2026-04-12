@@ -1,9 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import logging
 from logging import getLogger
 
-from megatron.core.utils import log_single_rank
+import torch
 
 logger = getLogger(__name__)
 
@@ -59,6 +58,7 @@ def mcore_gpt_load_te_state_dict_pre_hook(
                 key_rewrite_list += [(key, key.replace(old_name, new_name))]
 
     for old_key, new_key in key_rewrite_list:
-        log_single_rank(logger, logging.INFO, "replace {} with {}".format(old_key, new_key))
+        if torch.distributed.get_rank() == 0:
+            logger.info("replace {} with {}".format(old_key, new_key))
         state_dict[new_key] = state_dict[old_key]
         state_dict.pop(old_key)

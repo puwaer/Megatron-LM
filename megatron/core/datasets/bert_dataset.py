@@ -78,7 +78,7 @@ class BERTMaskedWordPieceDataset(MaskedWordPieceDataset):
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, Union[int, numpy.ndarray]]: The sample information wrapped in a dictionary
+            Dict[str, Union[int, numpy.ndarray]]: The
         """
 
         idx_beg, idx_end, target_sequence_length = self.sample_index[idx]

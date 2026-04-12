@@ -139,8 +139,10 @@ def tensor_swap(x, src_idxs, dst_idxs):
     x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
 
 
-async def await_process_call(call, process: multiprocessing.Process, timeout: float = 1.0):
-    """Repeatedly wait for a multiprocessing callable to resolve, aborting upon process failure.
+async def await_process_event(
+    event: multiprocessing.Event, process: multiprocessing.Process, timeout: float = 1.0
+) -> None:
+    """Repeatedly wait for a multiprocessing event to be set, aborting upon process failure.
 
     Note that the timeout in this function is only for checking process liveness.
     Its value should be set to a relatively high number. The only problem a high timeout
@@ -153,7 +155,8 @@ async def await_process_call(call, process: multiprocessing.Process, timeout: fl
         timeout: The timeout for each wait iteration in seconds.
     """
     while True:
-        if await asyncio.to_thread(call, timeout):
+        signal = await asyncio.to_thread(event.wait, timeout)
+        if signal:
             return
         if not process.is_alive():
             raise RuntimeError(

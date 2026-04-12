@@ -1,12 +1,7 @@
 #!/bin/bash
 set -e
 
-MLM_MODEL_CFG=${1}
-
-if [ -z $1 ]; then
-    printf "${MLM_ERROR} Model configuration name must be provided as the first argument (e.g. 'meta-llama/Llama-3.2-1B-Instruct')\n"
-    exit 1
-fi
+MLM_MODEL_CFG=$1
 
 # Bash coloring
 RED='\033[0;31m'
@@ -86,7 +81,7 @@ if [ -z ${LAUNCH_SCRIPT} ]; then
     LAUNCH_SCRIPT="torchrun --nproc_per_node=$((ETP * EP * PP * CP * DP))"
 fi
 
-# Install Model Optimizer if haven't.
+# Install TensorRT Model Optimizer if haven't.
 if [ -z ${MLM_SKIP_INSTALL} ]; then
     pip install -r ${SCRIPT_DIR}/requirements.txt
 fi

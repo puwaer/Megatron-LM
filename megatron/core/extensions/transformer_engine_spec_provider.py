@@ -1,8 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from __future__ import annotations
 
 import warnings
-from typing import Optional, cast
+from typing import Optional, Tuple
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
@@ -18,19 +17,18 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
-from megatron.core.transformer.moe.experts import (
-    GroupedMLP,
-    SequentialMLP,
-    TEGroupedMLP,
-    TEGroupedMLPSubmodules,
-)
-from megatron.core.transformer.torch_norm import LayerNormBuilder
+from megatron.core.transformer.dot_product_attention import DotProductAttention
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 from megatron.core.utils import get_te_version, is_te_min_version
 
 
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
+
+    def __init__(self, fallback_to_eager_attn: bool = False):
+        super().__init__()
+        self.fallback_to_eager_attn = fallback_to_eager_attn
 
     def linear(self) -> type:
         """Which linear module TE backend uses"""
@@ -52,7 +50,7 @@ class TESpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> LayerNormBuilder:
+    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
         """Which module to use for layer norm"""
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used
@@ -63,22 +61,20 @@ class TESpecProvider(BackendSpecProvider):
 
     def core_attention(self) -> type:
         """Which module to use for attention"""
+        if self.fallback_to_eager_attn:
+            return DotProductAttention
         return TEDotProductAttention
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> (
-        tuple[type[TEGroupedMLP], TEGroupedMLPSubmodules]
-        | tuple[type[SequentialMLP], MLPSubmodules]
-        | tuple[type[GroupedMLP], None]
-    ):
+    ) -> Tuple[type, Optional[MLPSubmodules]]:
         """Which module and submodules to use for grouped mlp"""
         if (
             moe_use_grouped_gemm
             and TEColumnParallelGroupedLinear is not None
             and not moe_use_legacy_grouped_gemm
         ):
-            return TEGroupedMLP, TEGroupedMLPSubmodules(
+            return TEGroupedMLP, MLPSubmodules(
                 linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
             )
         elif moe_use_grouped_gemm:
@@ -101,8 +97,6 @@ class TESpecProvider(BackendSpecProvider):
                 linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
             )
 
-    def activation_func(self) -> TEActivationFunctionBuilder | None:
+    def activation_func(self) -> type:
         """Which module to use for activation function"""
-        # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
-        # design these classes always meet the interface.
-        return cast(TEActivationFunctionBuilder, TEActivationOp)
+        return TEActivationOp

@@ -40,6 +40,10 @@ class TorchCommonSaveStrategy(SaveCommonStrategy):
     def save_common(self, common_state_dict: StateDict, checkpoint_dir: Union[str, Path]):
         """Save common part of the state dict."""
         if torch.distributed.get_rank() == 0:
+            # FIXME: this is a temporary fix to this error
+            # TypeError: cannot pickle 'torch._C._distributed_c10d.ProcessGroup' object
+            common_state_dict['content_metadata'].pop('dp_cp_group', None)
+
             path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
             if MultiStorageClientFeature.is_enabled():
                 msc = MultiStorageClientFeature.import_package()

@@ -39,9 +39,6 @@ pre:create_ci_branches:
       - branch: ci-approve-main
       - branch: ci-approve-dev
       - branch: ci-sync-branches
-      - branch: ci-testing-1
-      - branch: ci-testing-2
-      - branch: ci-testing-3
   tags:
     - arch/amd64
     - env/prod
@@ -71,6 +68,7 @@ pre:create_ci_branches_dev:
       - branch: ci-dev-rebuild-mcore-nemo-image
       - branch: ci-dev-mr
       - branch: ci-dev-nightly
+      - branch: ci-dev-weekly
       - branch: ci-dev-upgrade-dependencies
   tags:
     - arch/amd64
@@ -105,7 +103,7 @@ pre:label_merge_request:
     - cd gitlab-mr-labeler
     - go install .
     - cd ..
-    - go install github.com/itchyny/gojq/cmd/gojq@v0.12.17
+    - go install github.com/itchyny/gojq/cmd/gojq@latest
   script:
     - set -x
     - |

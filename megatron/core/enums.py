@@ -7,6 +7,8 @@ class ModelType(enum.Enum):
     """Model type."""
 
     encoder_or_decoder = 1
+    retro_encoder = 2
+    retro_decoder = 3
 
     @property
     def encoder_and_decoder(self):

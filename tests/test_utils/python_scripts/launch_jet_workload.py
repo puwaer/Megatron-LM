@@ -8,7 +8,6 @@ import re
 import signal
 import sys
 import time
-import uuid
 import zipfile
 from typing import Dict, List, Optional
 
@@ -112,11 +111,14 @@ def launch_and_wait_for_completion(
                                         "HF_HUB_CACHE": "/lustre/fsw/coreai_dlalgo_mcore/hf_hub",
                                         "TRANSFORMERS_OFFLINE": "1",
                                         "CLUSTER": cluster,
-                                        "RUN_ID": str(uuid.uuid4()),
                                     }
                                 }
                             }
                         }
+                    },
+                    "outputs": {
+                        "enabled": True,
+                        "artifacts_storages": [recipe_parser.resolve_artifact_config(cluster)],
                     },
                 },
                 wait_for_validation=True,
@@ -498,7 +500,6 @@ def main(
 
             if (
                 "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log
-                or "Throughput is slower than expected!" in concat_mainrank_log
             ) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
                 n_nondeterminism_attemps += 1
                 if n_nondeterminism_attemps < 3:

@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional
 import torch
 from torch.optim.optimizer import ParamsT
 
-from megatron.core.optimizer_param_scheduler import ParamGroupOverride
+from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank
@@ -76,7 +76,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f'{scale_mode} scale mode, extra_scale_factor={extra_scale_factor}',
             )
             size = [grad.size(-2), grad.size(-1)]
-            if partition_dim is not None:
+            if partition_dim:
                 size[partition_dim] *= get_pg_size(tp_group)
             orth_grad = newton_schulz_tp(
                 grad,
@@ -130,7 +130,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             tp_group = None
         partition_dim = None if self.mode == "blockwise" else getattr(p, "partition_dim", None)
         if partition_dim == -1:
-            # emerging-optimizers use None instead of -1 to indicate no tensor parallel
+            # llm-shower use different default value for partition_dim than TE.
+            # Because -1 is a valid index for ndarray, we decided to not overload it.
             partition_dim = None
 
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
@@ -165,7 +166,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 def get_megatron_muon_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
-    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = None,
+    config_overrides: Optional[Dict[ParamKey, OptimizerConfig]] = None,
     use_gloo_process_groups: bool = True,
     layer_wise_distributed_optimizer: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
@@ -187,44 +188,25 @@ def get_megatron_muon_optimizer(
 
     assert HAVE_EMERGING_OPTIMIZERS, "Emerging Optimizers is not installed."
 
-    # Dist-opt is not supported due to strong coupling with how DDP init grad buffer
-    # In theory we can change DDP to enable use muon and dist-opt-adam together
+    # dist-optim is not supported due to strong coupling with how DDP init grad buffer
+    # in thoery we can put some weight to use non-dist-muon and rest to dist-adam
+    # but there are strong dependency and assumption in DDP that prevent it
     if config.use_distributed_optimizer:
         raise Exception('muon with dist optimizer is not supported.')
-    # only support bf16 w/o loss scale now
-    if config.fp16:
-        raise Exception('muon with fp16 is not supported.')
 
     # before this function receive properly created collection
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
-
-    # Needed for torch_dist ckpt_format, unlike torch ckpt_format
-    # For other emerging optimizers, need to implement init_state_fn as well
-    # TODO(boxiangw): Improve usability after optimizer refactor
-    # TODO(boxiangw): support precision aware optimizer
-    def muon_init_state_fn(opt, config=None):
-        for group in opt.param_groups:
-            for p in group['params']:
-                if len(opt.state[p]) == 0:
-                    opt.state[p]['momentum_buffer'] = torch.zeros_like(p.data)
-
-    def adam_init_state_fn(opt, config=None):
-        for group in opt.param_groups:
-            for p in group['params']:
-                if len(opt.state[p]) == 0:
-                    if config is None or not config.use_precision_aware_optimizer:
-                        opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
-                        opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
-                    else:
-                        opt.initialize_state(p)
 
     optimizers = []
     # record list of non/linear params
     linear_params = []
     nonlinear_params = []
+
     for model_chunk in model_chunks:
         # use config to determine qkv split shapes.
         # no need to check tp since tp splits by head and this is per head(group) dimension
@@ -248,45 +230,60 @@ def get_megatron_muon_optimizer(
             # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
-            # TODO(deyuf): currently only allow 2D non-embedding weight to avoid breaking
-            if (
-                not getattr(param, 'is_embedding_or_output_parameter', False)
-                and len(param.shape) == 2
+            # TODO(deyuf): might not be sufficient for future algorithm. revisit this conditioning
+            if not getattr(param, 'is_embedding_or_output_parameter', False) and not (
+                len(param.shape) == 1
             ):
                 linear_params.append(param)
             else:
                 nonlinear_params.append(param)
-
-    muon_kwargs = {
-        "lr": config.lr,
-        "momentum_beta": config.muon_momentum,
-        "use_nesterov": config.muon_use_nesterov,
-        "weight_decay": config.weight_decay,
-        "fp32_matmul_prec": config.muon_fp32_matmul_prec,
-        "num_ns_steps": config.muon_num_ns_steps,
-        "scale_mode": config.muon_scale_mode,
-        "split_qkv": config.muon_split_qkv,
-        "is_qkv_fn": lambda p: getattr(p, "is_qkv", False),
-        "qkv_split_shapes": qkv_split_shapes,
-        "extra_scale_factor": config.muon_extra_scale_factor,
-        "pg_collection": pg_collection,
-        "mode": config.muon_tp_mode,
-    }
 
     # freezing nonlinear params and get param groups for muon
     for param in nonlinear_params:
         param.requires_grad = False
 
     linear_param_groups = _get_param_groups(model_chunks, config, config_overrides)
-    # if layerwise distributed optimizer is not used, need to handle ep params separately
-    expert_param_groups = []
-    if not layer_wise_distributed_optimizer:
-        for group in linear_param_groups:
-            if group['is_expert_parallel']:
-                expert_param_groups.append(group)
-                linear_param_groups.remove(group)
 
-    optimizer = TensorParallelMuon(linear_param_groups, **muon_kwargs)
+    optimizer = TensorParallelMuon(
+        linear_param_groups,
+        lr=config.lr,
+        momentum_beta=config.muon_momentum,
+        use_nesterov=config.muon_use_nesterov,
+        weight_decay=config.weight_decay,
+        fp32_matmul_prec=config.muon_fp32_matmul_prec,
+        num_ns_steps=config.muon_num_ns_steps,
+        scale_mode=config.muon_scale_mode,
+        split_qkv=config.muon_split_qkv,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=qkv_split_shapes,
+        extra_scale_factor=config.muon_extra_scale_factor,
+        pg_collection=pg_collection,
+        mode=config.muon_tp_mode,
+    )
+
+    # Needed for torch_dist ckpt_format, unlike torch ckpt_format
+    # For other emerging optimizers, need to implement init_state_fn as well
+    # TODO(boxiangw): Improve usability after optimizer refactor
+    # TODO(boxiangw): support precision aware optimizer
+    def muon_init_state_fn(opt, config=None):
+        for group in opt.param_groups:
+            for p in group['params']:
+                if len(opt.state[p]) == 0:
+                    opt.state[p]['momentum_buffer'] = torch.zeros_like(p.data)
+
+    def adam_init_state_fn(opt, config=None):
+        for group in opt.param_groups:
+            for p in group['params']:
+                if len(opt.state[p]) == 0:
+                    if config is None or not config.use_precision_aware_optimizer:
+                        opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                        opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                    else:
+                        opt.initialize_state(p)
+
+    # need to wrap into megatron mix precision optimizer. (only support bf16 w/o loss scale now)
+    if config.fp16:
+        raise Exception('muon with fp16 is not supported.')
 
     reset_config_bf16 = False
     if config.bf16:
@@ -305,18 +302,6 @@ def get_megatron_muon_optimizer(
         optimizer = FP32Optimizer(optimizer, config, muon_init_state_fn)
 
     optimizers.append(optimizer)
-
-    # expert optimizer exists meaning layerwise distributed optimizer is not used
-    if len(expert_param_groups) > 0:
-        expert_optimizer = TensorParallelMuon(expert_param_groups, **muon_kwargs)
-        if config.bf16:
-            expert_optimizer = Float16OptimizerWithFloat16Params(
-                expert_optimizer, config, None, muon_init_state_fn
-            )
-        else:
-            expert_optimizer = FP32Optimizer(expert_optimizer, config, muon_init_state_fn)
-        setattr(expert_optimizer, 'grad_stats_parallel_group', pg_collection.tp_ep_pp)
-        optimizers.append(expert_optimizer)
 
     # done with muon, unfreeze nonlinear and freeze linear
     for param in nonlinear_params:
@@ -337,7 +322,6 @@ def get_megatron_muon_optimizer(
         param.requires_grad = True
 
     # chain everything together
-    init_fns = [muon_init_state_fn] + len(chained_adam.chained_optimizers) * [adam_init_state_fn]
     optimizers += chained_adam.chained_optimizers
 
     if layer_wise_distributed_optimizer:
@@ -345,6 +329,9 @@ def get_megatron_muon_optimizer(
         if reset_config_bf16:
             config.bf16 = True
         return LayerWiseDistributedOptimizer(
-            optimizers, config, pg_collection, init_state_fn_list=init_fns
+            optimizers,
+            config,
+            pg_collection,
+            init_state_fn_list=[muon_init_state_fn, adam_init_state_fn],
         )
     return ChainedOptimizer(optimizers)

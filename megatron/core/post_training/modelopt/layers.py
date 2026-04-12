@@ -1,14 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional, cast
+from typing import Callable, List, Optional
 
 import torch
 
 from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
@@ -20,16 +18,7 @@ try:
 
     HAVE_TE = True
 except ImportError:
-    if TYPE_CHECKING:
-        # Unambiguously treat transformer_engine as available during type checking.
-        import transformer_engine as te  # type: ignore[import]
-
-        HAVE_TE = True
-    else:
-        HAVE_TE = False
-
-logger = logging.getLogger(__name__)
-
+    HAVE_TE = False
 
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
     "quant_cfg": {
@@ -61,9 +50,7 @@ class Norm:
     mismatch issue.
     """
 
-    def __new__(
-        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5
-    ) -> LayerNormInterface:
+    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
         if not HAVE_TE:
             raise ImportError(
                 "Transformer-Engine is not installed, please install it with "
@@ -105,7 +92,7 @@ class Norm:
             instance._register_state_dict_hook(_state_dict_hook)
             instance._register_load_state_dict_pre_hook(_load_state_dict_pre_hook)
 
-        return cast(LayerNormInterface, instance)
+        return instance
 
 
 class Linear(torch.nn.Linear):
@@ -191,7 +178,7 @@ class RealQuantTransformerLayer(TransformerLayer):
     """Real quantization transformer layer base class.
 
     This base class iniitialize the default TransformerLayer and immediately
-    perform weight-only real quantization via Model Optimizer.
+    perform weight-only real quantization via TensorRT Model Optimizer.
     All linear weights (Linear, ColumnParallelLinear, RowParallelLinear) picked
     up will be replaced with low-bit data type (default torch.uint8). If sub-byte
     real_quant_cfg is used, the weight shape will further be half.

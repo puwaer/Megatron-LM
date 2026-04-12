@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, Mock, create_autospec, patch
 import pytest
 import torch
 
-from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -16,7 +15,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -52,26 +50,20 @@ class TestInferenceWandbLogging:
         max_sequence_length=512,
         buffer_size_gb=0.03,
         block_size_tokens=128,
-        logging_step_interval=0,
         metrics_writer=None,
     ):
         """Helper to create a DynamicInferenceContext."""
         return DynamicInferenceContext(
-            model_config=TransformerConfig(
-                params_dtype=params_dtype,
-                num_layers=num_layers,
-                kv_channels=kv_channels,
-                num_attention_heads=num_attention_heads,
-            ),
-            inference_config=InferenceConfig(
-                max_sequence_length=max_sequence_length,
-                num_cuda_graphs=None,
-                buffer_size_gb=buffer_size_gb,
-                block_size_tokens=block_size_tokens,
-                unified_memory_level=0,  # unit tests currently broken with UVM
-                logging_step_interval=logging_step_interval,
-                metrics_writer=metrics_writer,
-            ),
+            params_dtype=params_dtype,
+            num_layers=num_layers,
+            kv_channels=kv_channels,
+            num_attention_heads=num_attention_heads,
+            max_sequence_length=max_sequence_length,
+            num_cuda_graphs=None,
+            buffer_size_gb=buffer_size_gb,
+            block_size_tokens=block_size_tokens,
+            metrics_writer=metrics_writer,
+            unified_memory_level=0,  # unit tests currently broken with UVM
         )
 
     @pytest.mark.internal
@@ -93,7 +85,8 @@ class TestInferenceWandbLogging:
         assert 'block_count_avail' in stats
         assert 'active_token_count' in stats
         assert 'total_request_count' in stats
-        assert 'max_requests' in stats
+        assert 'max_total_requests' in stats
+        assert 'max_active_requests' in stats
 
         # Verify values for empty context
         assert stats['allocated_blocks'] == 0
@@ -140,8 +133,10 @@ class TestInferenceWandbLogging:
         assert stats_after['total_blocks'] > 0
 
         # Verify that max_requests remains constant
-        assert stats_after['max_requests'] == stats['max_requests']
-        assert stats_after['max_requests'] > 0
+        assert stats_after['max_total_requests'] == stats['max_total_requests']
+        assert stats_after['max_total_requests'] > 0
+        assert stats_after['max_active_requests'] == stats['max_active_requests']
+        assert stats_after['max_active_requests'] > 0
 
         # Verify block availability decreased after allocation
         assert stats_after['block_count_avail'] < stats['block_count_avail']
@@ -185,7 +180,8 @@ class TestInferenceWandbLogging:
             'block_count_avail',
             'active_token_count',
             'total_request_count',
-            'max_requests',
+            'max_total_requests',
+            'max_active_requests',
         ]
 
         for field in int_fields:
@@ -203,14 +199,12 @@ class TestInferenceWandbLogging:
     @pytest.mark.internal
     @patch('megatron.core.inference.engines.dynamic_engine.HAVE_WANDB', True)
     def test_engine_logging_step_interval_zero(self):
-        """Test that no logging occurs when logging_step_interval is 0."""
+        """Test that no logging occurs when inference_logging_step_interval is 0."""
         mock_wandb = Mock()
         mock_wandb.__name__ = "wandb"
         mock_wandb.log = Mock()
 
-        dynamic_context = self._get_dynamic_context(
-            logging_step_interval=0, metrics_writer=mock_wandb
-        )
+        dynamic_context = self._get_dynamic_context(metrics_writer=mock_wandb)
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
@@ -220,7 +214,12 @@ class TestInferenceWandbLogging:
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
 
-        engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)
+        engine = DynamicInferenceEngine(
+            controller=mock_controller,
+            context=dynamic_context,
+            random_seed=123,
+            inference_logging_step_interval=0,  # Disabled
+        )
 
         # Verify log was never called
         mock_wandb.log.assert_not_called()
@@ -230,16 +229,15 @@ class TestInferenceWandbLogging:
         """Test that paused requests are correctly reflected in stats."""
         set_rounder(1)
         dynamic_context = DynamicInferenceContext(
-            model_config=TransformerConfig(
-                params_dtype=torch.float32, num_layers=2, kv_channels=64, num_attention_heads=8
-            ),
-            inference_config=InferenceConfig(
-                max_sequence_length=128,
-                num_cuda_graphs=None,
-                buffer_size_gb=0.01,  # Small buffer to force pausing
-                block_size_tokens=32,
-                unified_memory_level=0,  # unit tests currently broken with UVM
-            ),
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            num_cuda_graphs=None,
+            buffer_size_gb=0.01,  # Small buffer to force pausing
+            block_size_tokens=32,
+            unified_memory_level=0,  # unit tests currently broken with UVM
         )
 
         # Add multiple requests to potentially trigger pausing
@@ -263,7 +261,7 @@ class TestInferenceWandbLogging:
     @pytest.mark.internal
     def test_metrics_writer_none_handling(self):
         """Test that engine handles None metrics_writer gracefully."""
-        dynamic_context = self._get_dynamic_context(logging_step_interval=10, metrics_writer=None)
+        dynamic_context = self._get_dynamic_context(metrics_writer=None)
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
@@ -274,8 +272,13 @@ class TestInferenceWandbLogging:
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
 
         # Should not raise error even with logging interval set
-        engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)
+        engine = DynamicInferenceEngine(
+            controller=mock_controller,
+            context=dynamic_context,
+            random_seed=123,
+            inference_logging_step_interval=10,
+        )
 
         # Verify engine was created successfully
-        assert engine.logging_step_interval == 10
-        assert engine.metrics_writer is None
+        assert engine.inference_logging_step_interval == 10
+        assert engine.context.metrics_writer is None

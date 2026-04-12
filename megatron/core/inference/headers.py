@@ -17,7 +17,6 @@ class Headers(Enum):
     UNPAUSE = auto()
     SUSPEND = auto()
     RESUME = auto()
-    INCREMENT_STALENESS = auto()
     STOP = auto()
     STOP_ACK = auto()
 

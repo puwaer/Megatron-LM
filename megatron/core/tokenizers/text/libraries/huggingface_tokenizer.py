@@ -10,8 +10,6 @@ try:
 except ModuleNotFoundError:
     HAVE_TRANSFORMERS = False
 
-from megatron.core.utils import log_single_rank
-
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 
 logger = logging.getLogger(__name__)
@@ -36,9 +34,9 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         cls_token: Optional[str] = None,
         unk_token: Optional[str] = None,
         additional_special_tokens: Optional[List] = [],
-        use_fast: Optional[bool] = True,
+        use_fast: Optional[bool] = False,
         trust_remote_code: Optional[bool] = False,
-        include_special_tokens: bool = True,
+        include_special_tokens: bool = False,
         chat_template: str = None,
     ):
         """
@@ -168,11 +166,9 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             tokenizer.resize_token_embeddings(tokenizer_default.vocab_size)
             """
 
-            log_single_rank(
-                logger,
-                logging.WARNING,
+            logger.warning(
                 f'{new_tokens_in_vocab} \n will be added to the vocabulary.\n'
-                f'Please resize your model accordingly.',
+                f'Please resize your model accordingly.'
             )
         self.add_special_tokens(special_tokens_dict)
         self.space_sensitive = self.text_to_tokens('x y') != self.text_to_tokens(
@@ -200,11 +196,7 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         num_tokens_added = self.tokenizer.add_special_tokens(special_tokens_dict)
 
         if num_tokens_added > 0:
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f'{num_tokens_added} special tokens added, resize your model accordingly.',
-            )
+            logger.info(f'{num_tokens_added} special tokens added, resize your model accordingly.')
         for k in self.tokenizer.SPECIAL_TOKENS_ATTRIBUTES:
             setattr(self, k, getattr(self.tokenizer, k, None))
         return num_tokens_added
@@ -249,22 +241,13 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         ids = self.tokens_to_ids(tokens)
         return ids
 
-    def ids_to_text(self, ids: List[int], remove_special_tokens: Optional[bool] = None) -> str:
-        """Converts list of ids to text.
-
-        When remove_special_tokens is None, uses not self.include_special_tokens so that
-        --tokenizer-hf-include-special-tokens keeps EOS (and other special tokens) in
-        detokenized output (e.g. for RL trajectory consistency).
-        """
-        if remove_special_tokens is None:
-            remove_special_tokens = not self.include_special_tokens
+    def ids_to_text(self, ids: List[int], remove_special_tokens: bool = True) -> str:
+        """Converts list of ids to text."""
         tokens = self.ids_to_tokens(ids)
         if remove_special_tokens:
-            tokens_clean = [
-                t for t in tokens if t is not None and t not in self.tokenizer.all_special_tokens
-            ]
+            tokens_clean = [t for t in tokens if t not in self.tokenizer.all_special_tokens]
         else:
-            tokens_clean = [t for t in tokens if t is not None]
+            tokens_clean = tokens
         text = self.tokens_to_text(tokens_clean)
         return text
 

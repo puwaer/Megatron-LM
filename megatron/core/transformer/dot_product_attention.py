@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 import math
@@ -12,6 +12,9 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.dot_product_attention_context_parallel import (
+    AttentionFuncionWithContextParallel,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -45,18 +48,21 @@ class DotProductAttention(MegatronModule):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        attention_dropout: Optional[float] = None,
-        softmax_scale: Optional[float] = None,
-        cp_comm_type: Optional[str] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        attention_dropout: float = None,
+        softmax_scale: float = None,
+        cp_comm_type: str = None,
+        pg_collection: ProcessGroupCollection = None,
     ):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
 
-        assert (
-            self.config.context_parallel_size == 1
-        ), "Context parallelism is only supported by TEDotProductAttention!"
+        if self.config.context_parallel_size > 1:
+            assert attention_dropout is None and self.config.attention_dropout == 0.0, (
+                f'DotProductAttention with context parallelism does not support attention dropout,'
+                f' but got {self.config.context_parallel_size=},'
+                f' {attention_dropout=}, and {self.config.attention_dropout=}.'
+            )
 
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
@@ -144,9 +150,9 @@ class DotProductAttention(MegatronModule):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Optional[Tensor],
-        attn_mask_type: Optional[AttnMaskType] = None,
-        attention_bias: Optional[Tensor] = None,
+        attention_mask: Tensor,
+        attn_mask_type: AttnMaskType = None,
+        attention_bias: Tensor = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Forward."""
@@ -173,6 +179,19 @@ class DotProductAttention(MegatronModule):
             value = value.repeat_interleave(
                 self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
             )
+
+        if self.config.context_parallel_size > 1:
+            output = AttentionFuncionWithContextParallel.apply(
+                query,
+                key,
+                value,
+                attention_mask,
+                self.config.attention_dropout,
+                self.softmax_scale,
+                parallel_state.get_context_parallel_group(),
+            )
+            output = output.view(query.shape[0], query.shape[1], self.hidden_size_per_partition)
+            return output
 
         # [b, np, sq, sk]
         output_size = (query.size(1), query.size(2), query.size(0), key.size(0))
@@ -253,7 +272,7 @@ class DotProductAttention(MegatronModule):
     def sharded_state_dict(
         self,
         prefix: str = '',
-        sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Sharded state dict for the learnable softmax offset parameter"""

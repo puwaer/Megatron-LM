@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from functools import partial
 from unittest import mock
 
 import pytest
@@ -10,10 +11,7 @@ from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_experimental_attention_variant_module_spec,
-    get_transformer_block_with_experimental_attention_variant_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
@@ -88,13 +86,10 @@ class TestGatedDeltaNet:
             tensor_model_parallel_size=tp_size,
             sequence_parallel=sp,
             context_parallel_size=cp_size,
-            experimental_attention_variant="gated_delta_net",
-            linear_attention_freq=[1],
-            transformer_impl="transformer_engine",
         )
-        gdn_submodules = get_experimental_attention_variant_module_spec(
-            config=self.transformer_config
-        ).submodules
+        gdn_submodules = get_gpt_layer_with_transformer_engine_spec(
+            linear_attention_type="gated_delta_net", normalization="RMSNorm"
+        ).submodules.self_attention.submodules
 
         self.gdn = GatedDeltaNet(
             self.transformer_config,
@@ -157,13 +152,12 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
     sequence_length = 256
     micro_batch_size = 4
     hidden_size = 128
+    normalization = "RMSNorm"
 
     # Model initialization function
-    def initialize_gpt_model(
-        config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
-    ):
-        layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
-            config=config, vp_stage=None, pp_rank=None
+    def initialize_gpt_model(config, pre_process=True, post_process=True, vp_stage=None):
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            linear_attention_type="gated_delta_net", normalization=normalization
         )
         gpt_model = GPTModel(
             config=config,
@@ -173,7 +167,6 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
-            pg_collection=pg_collection,
         )
         return gpt_model
 
@@ -201,15 +194,12 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         linear_num_key_heads=4,
         linear_num_value_heads=8,
         num_layers=1,
-        normalization="RMSNorm",
+        normalization=normalization,
         use_cpu_initialization=True,
         layernorm_zero_centered_gamma=True,
         num_attention_heads=8,
         activation_func=F.silu,
         bf16=True,
-        experimental_attention_variant="gated_delta_net",
-        linear_attention_freq=[1],
-        transformer_impl="transformer_engine",
     )
 
     with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_gdn', sync=True) as ckpt_dir:
@@ -221,7 +211,9 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         init_basic_mock_args(mock_args, 1, 1, bf16=True)
         mock_args.context_parallel_size = 1
         mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
+        gpt_model = unwrap_model(
+            get_model(partial(initialize_gpt_model, config=transformer_config))
+        )
 
         # Initialize args and save checkpoint
         init_checkpointing_mock_args(mock_args, ckpt_dir, False)
@@ -255,10 +247,8 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
         mock_args.context_parallel_size = cp
         mock_args.sequence_parallel = sp
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        pg_collection.embd = parallel_state.get_embedding_group()
         gpt_model = unwrap_model(
-            get_model(initialize_gpt_model, config=transformer_config, pg_collection=pg_collection)
+            get_model(partial(initialize_gpt_model, config=transformer_config))
         )
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             with mock.patch('megatron.training.checkpointing.update_num_microbatches'):

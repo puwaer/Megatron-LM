@@ -85,7 +85,6 @@ ARGS=" \
   \
   --output-path ${OUTPUT_PATH} \
   --output-every-n-results 512 \
-  --inference-logging-step-interval 1 \
 "
 
 # Enable cuda graphs.

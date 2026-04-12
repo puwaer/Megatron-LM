@@ -50,7 +50,6 @@ try:
     from causal_conv1d import causal_conv1d_fn
 except ImportError:
     causal_conv1d_fn = None
-    causal_conv1d_update = None
 
 
 logger = logging.getLogger(__name__)
@@ -101,9 +100,7 @@ class GatedDeltaNet(MegatronModule):
         """
 
         if not HAVE_FLA:
-            raise ImportError(
-                "FLA is not installed. Please install it with `pip install flash-linear-attention`."
-            )
+            raise ImportError("FLA is not installed. Please install it with `pip install fla`.")
 
         super().__init__(config)
 
@@ -244,7 +241,7 @@ class GatedDeltaNet(MegatronModule):
                     dtype=self.config.params_dtype,
                     device=torch.cuda.current_device(),
                 ).uniform_(*self.A_init_range)
-                self.A_log.data.copy_(torch.log(A))
+                self.A_log.data.copy_(A)
 
     def forward(
         self,
@@ -252,12 +249,15 @@ class GatedDeltaNet(MegatronModule):
         attention_mask: Tensor,
         key_value_states: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-        **kwargs,
     ):
         """
         Perform a forward pass through the GDN module.
@@ -268,6 +268,11 @@ class GatedDeltaNet(MegatronModule):
             key_value_states (Optional[Tensor]): Key/value states (for cross attention).
             inference_context (Optional[BaseInferenceContext]): Inference context that manages
                 KV cache.
+            rotary_pos_emb (Optional[Union[Tensor, Tuple[Tensor, Tensor]]]): Rotary
+                embedding tensor(s).
+            rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
+            rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            rotary_pos_cos_sin (Optional[Tensor]): Combined rotary embedding cosine and sine.
             attention_bias (Optional[Tensor]): Attention bias.
             packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for
@@ -507,19 +512,6 @@ class GatedDeltaNet(MegatronModule):
             )
 
         return sharded_state_dict
-
-    def backward_dw(self):
-        """Execute weight gradient computation for all linear layers."""
-        self._backward_in_proj()
-        self._backward_out_proj()
-
-    def _backward_in_proj(self):
-        """Computes weight gradients of input projection layer."""
-        self.in_proj.backward_dw()
-
-    def _backward_out_proj(self):
-        """Computes weight gradients of output projection layer."""
-        self.out_proj.backward_dw()
 
 
 def _split_tensor_factory(

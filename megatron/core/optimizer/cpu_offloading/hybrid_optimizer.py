@@ -1,18 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict
 
 import torch
-
-try:
-    from megatron.core.fp8_utils import is_float8tensor, quantize_param_shard
-except ImportError:
-
-    def is_float8tensor(t):
-        return False
-
-    def quantize_param_shard(*args, **kwargs):
-        pass
 
 
 def _param_generator(cpu_optimizer):
@@ -59,11 +49,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         cpu_optimizer_cls=None,
         gpu_optimizer_cls=None,
         param_update_in_fp32: bool = False,
-        param_update_dtype: Optional[torch.dtype] = None,
-        data_parallel_group=None,
-        fp8_amax_sync_interval: int = 1,
-        numa_node: Optional[int] = None,
-        fp8_grad_offload: bool = False,
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
@@ -76,10 +61,6 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 "cpu_optimizer_cls": cpu_optimizer_cls,
                 "gpu_optimizer_cls": gpu_optimizer_cls,
                 "param_update_in_fp32": param_update_in_fp32,
-                "param_update_dtype": param_update_dtype,
-                "fp8_amax_sync_interval": fp8_amax_sync_interval,
-                "numa_node": numa_node,
-                "fp8_grad_offload": fp8_grad_offload,
                 "pin_cpu_grads": pin_cpu_grads,
                 "pin_cpu_params": pin_cpu_params,
                 "overlap_cpu_optimizer_d2h_h2d": overlap_cpu_optimizer_d2h_h2d,
@@ -94,34 +75,17 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.pin_cpu_params = pin_cpu_params
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
-        self.param_update_dtype = param_update_dtype
-        self.data_parallel_group = data_parallel_group
-        self.fp8_amax_sync_interval = fp8_amax_sync_interval
-        self.numa_node = numa_node
-        self.fp8_grad_offload = fp8_grad_offload
         self.sub_optimizer_kwargs = kwargs
-
-        # Effective master weight dtype.
-        # param_update_dtype takes priority; param_update_in_fp32 is the legacy flag.
-        if param_update_dtype is not None:
-            self._master_dtype = param_update_dtype
-        elif param_update_in_fp32:
-            self._master_dtype = torch.float32
-        else:
-            self._master_dtype = None
-
-        self._fp8_step_count = 0
-        self._pending_fp8_amax_params: List = []
 
         self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
 
     def _set_sub_optimizer_grads(self):
-        # Set gradients on GPU-resident master copies (non-CPU-offloaded params).
-        if self._master_dtype is not None:
+        if self.param_update_in_fp32:
             for param in self.param_to_fp32_param:
                 if param in self.gpu_params_map_cpu_copy:
-                    # Skip CPU-offloaded params; their grad is handled below.
+                    # Skip if the param is offloaded to CPU, it should be handled
+                    # in the following part.
                     continue
                 fp32_param = self.param_to_fp32_param[param]
                 grad = getattr(param, "decoupled_grad", param.grad)
@@ -141,41 +105,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     continue
 
                 param.requires_grad = False
-                if self.fp8_grad_offload:
-                    # Opt-4: quantize gradient to FP8 on GPU before D2H transfer.
-                    if not hasattr(self, 'cpu_copy_map_grad_fp8_scale'):
-                        self.cpu_copy_map_grad_fp8_scale: Dict[torch.Tensor, torch.Tensor] = {}
-                        self.cpu_copy_map_grad_scale_cpu: Dict[torch.Tensor, torch.Tensor] = {}
-                    if param not in self.cpu_copy_map_grad_fp8_scale:
-                        self.cpu_copy_map_grad_fp8_scale[param] = torch.ones(
-                            1, dtype=torch.float32, device='cuda'
-                        )
-                        self.cpu_copy_map_grad_scale_cpu[param] = torch.empty(
-                            1, dtype=torch.float32, pin_memory=self.pin_cpu_grads, device='cpu'
-                        )
-                    scale = self.cpu_copy_map_grad_fp8_scale[param]
-                    # Simple per-tensor scaling: amax-based quantization to e4m3
-                    grad_fp32 = grad.float()
-                    amax = grad_fp32.abs().max().clamp(min=1e-12)
-                    # E4M3 max value is 448.0
-                    new_scale = 448.0 / amax
-                    scale.copy_(new_scale)
-                    grad_scaled = (grad_fp32 * new_scale).to(torch.float8_e4m3fn)
-                    if param not in self.cpu_copy_map_grad:
-                        self.cpu_copy_map_grad[param] = torch.empty(
-                            param.shape, dtype=torch.float8_e4m3fn,
-                            pin_memory=self.pin_cpu_grads, device="cpu"
-                        )
-                        param.grad = None  # will be set before cpu step
-                    self.cpu_copy_map_grad[param].data.copy_(grad_scaled, non_blocking=True)
-                    self.cpu_copy_map_grad_scale_cpu[param].copy_(scale, non_blocking=True)
-                else:
-                    if param not in self.cpu_copy_map_grad:
-                        self.cpu_copy_map_grad[param] = torch.empty(
-                            param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
-                        )
-                        param.grad = self.cpu_copy_map_grad[param]
-                    self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
+                if param not in self.cpu_copy_map_grad:
+                    self.cpu_copy_map_grad[param] = torch.empty(
+                        param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
+                    )
+                    param.grad = self.cpu_copy_map_grad[param]
+
+                self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
 
     def _register_param_copy_back_gpu_hook(self):
@@ -185,12 +121,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        if is_float8tensor(gpu_param):
-                            # FP8 copy-back is handled by distrib_optimizer via
-                            # _quantize_fp8_from_hdo_masters() after the step.
-                            continue
                         gpu_param.data.copy_(param.data, non_blocking=True)
-                self._h2d_stream.record_event().wait(torch.cuda.current_stream())
+                self._d2h_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
 
@@ -199,11 +131,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 for group in self.param_groups:
                     for param in group["params"]:
                         if param in self.gpu_params_map_cpu_copy:
-                            # Skip CPU-offloaded params; handled by param_copy_back_gpu_hook.
+                            # Skip if the param is offloaded to GPU, it has been
+                            # copied back in the previous hook.
                             continue
-                        if is_float8tensor(param):
-                            # FP8 GPU-resident params handled by _copy_fp8_masters_back().
-                            continue
+
                         if param in self.param_to_fp32_param:
                             fp32_param = self.param_to_fp32_param[param]
                             param.data.copy_(fp32_param.data)
@@ -213,108 +144,16 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for optimizer in self.sub_optimizers:
             if optimizer is not self.gpu_optimizer:
                 optimizer.register_step_post_hook(param_copy_back_gpu_hook_closure())
-            elif self.param_update_in_fp32 or self._master_dtype is not None:
+            elif self.param_update_in_fp32:
                 optimizer.register_step_post_hook(fp32_param_copy_back_gpu_hook_closure())
-
-    def _alloc_cpu_tensor(self, ref_tensor: torch.Tensor) -> torch.Tensor:
-        """Allocate a pinned CPU tensor, optionally bound to a specific NUMA node.
-
-        When numa_node is set we try to use libnuma for NUMA-aware allocation so
-        that the master weights reside on the CPU socket physically closest to the
-        GPU's PCIe bus, reducing H2D/D2H transfer latency on multi-socket servers.
-        Falls back silently to standard pinned memory when libnuma is unavailable.
-        """
-        cpu = ref_tensor.cpu()
-        if self.numa_node is None:
-            return cpu.pin_memory()
-        try:
-            import ctypes
-
-            libnuma = ctypes.CDLL("libnuma.so.1", use_errno=True)
-            size = cpu.numel() * cpu.element_size()
-            ptr = libnuma.numa_alloc_onnode(ctypes.c_size_t(size), ctypes.c_int(self.numa_node))
-            if ptr:
-                buf = torch.frombuffer(
-                    (ctypes.c_char * size).from_address(ptr), dtype=cpu.dtype
-                ).pin_memory()
-                buf.copy_(cpu)
-                return buf
-        except (OSError, AttributeError):
-            pass
-        return cpu.pin_memory()
-
-    def _quantize_fp8_param_local(self, fp8_param, bf16_master_gpu) -> None:
-        """Local FP8 quantization of one param without amax all-reduce.
-
-        Used by the per-param pipeline hook (Opt-1). The amax all-reduce is
-        deferred and batched in _copy_fp8_masters_back().
-        """
-        quantize_param_shard(
-            [fp8_param],
-            [bf16_master_gpu],
-            [0],
-            self.data_parallel_group,
-            sync_amaxes=False,
-        )
-
-    def _copy_fp8_masters_back(self, fp8_params_override: Optional[List] = None) -> None:
-        """Quantize BF16/fp32 master weights back to FP8 GPU model param buffers.
-
-        For non-overlap mode (overlap_cpu_optimizer_d2h_h2d=False):
-          - Quantizes each FP8 param from its master (moving CPU masters to GPU
-            if necessary) and performs the data-parallel amax all-reduce.
-
-        For overlap mode (overlap_cpu_optimizer_d2h_h2d=True):
-          - Per-param local quantization is already done inside
-            param_copy_back_gpu_hook (Opt-1). Call this with
-            fp8_params_override=list-of-fp8-params to run only the batched
-            amax all-reduce for those params (sync_amaxes=True, main_params=None).
-
-        Opt-2: amax all-reduce is skipped on steps where
-        (step_count % fp8_amax_sync_interval != 0).
-        """
-        if fp8_params_override is not None:
-            # Overlap mode: local quantization already done; only sync amaxes.
-            if fp8_params_override:
-                quantize_param_shard(
-                    fp8_params_override,
-                    [None] * len(fp8_params_override),
-                    [0] * len(fp8_params_override),
-                    self.data_parallel_group,
-                    sync_amaxes=True,
-                )
-            return
-
-        fp8_gpu_params: List = []
-        bf16_masters_gpu: List = []
-        for orig_param, master_param in self.param_to_fp32_param.items():
-            if not is_float8tensor(orig_param):
-                continue
-            fp8_gpu_params.append(orig_param)
-            # Move CPU-pinned masters to GPU for quantization.
-            bf16_masters_gpu.append(master_param.to(orig_param.device))
-
-        if not fp8_gpu_params:
-            return
-
-        self._fp8_step_count += 1
-        do_sync = (self._fp8_step_count % self.fp8_amax_sync_interval == 0)
-        quantize_param_shard(
-            fp8_gpu_params,
-            bf16_masters_gpu,
-            [0] * len(fp8_gpu_params),
-            self.data_parallel_group,
-            sync_amaxes=do_sync,
-        )
 
     def step(self, closure=None):
         """
         Override the step method to perform the following operations:
             1. Sync the HDO param_groups to sub-optimizers.
             2. Sync the grads from GPU to CPU.
-            3. Step the sub-optimizers (GPU then CPU).
-            4. Quantize FP8 masters back to model param buffers.
-            5. Sync the sub-optimizers state to HDO.
+            3. Step the sub-optimizers.
+            4. Sync the sub-optimizers state to HDO.
         """
         # Sync param_groups to sub-optimizers before each step to make sure
         # the lr, wd, etc. are up-to-date.
@@ -332,36 +171,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             d2h_event = self._cpu_optimizer_map_data_event.pop(cpu_optimizer, None)
             if d2h_event is not None:
                 d2h_event.synchronize()
-            # Opt-4: dequantize FP8 grads to BF16 before the CPU optimizer step.
-            if self.fp8_grad_offload:
-                self._dequantize_fp8_grads_for_optimizer(cpu_optimizer)
             cpu_optimizer.step(closure)
-
-        # FP8 quantization and amax all_reduce are handled by distrib_optimizer
-        # via _quantize_fp8_from_hdo_masters() to ensure consistent param counts
-        # across all data-parallel ranks (different ranks hold different shard sizes).
 
         # Sync state and param_groups to HDO after each step.
         # NOTE: It is possible for the optimizer to change the properties
         #   in param_groups.
         self._sync_sub_optimizers_state_to_hdo()
-
-    def _dequantize_fp8_grads_for_optimizer(self, cpu_optimizer) -> None:
-        """Dequantize FP8 gradients from the D2H buffer to BF16 and set param.grad.
-
-        Called before each CPU optimizer step when fp8_grad_offload=True.
-        """
-        for param in _param_generator(cpu_optimizer):
-            if not (
-                hasattr(self, 'cpu_copy_map_grad_fp8_scale')
-                and param in self.cpu_copy_map_grad_fp8_scale
-            ):
-                continue
-            fp8_grad_cpu = self.cpu_copy_map_grad[param]        # uint8 on CPU
-            scale_cpu = self.cpu_copy_map_grad_scale_cpu[param]  # float32 on CPU
-            # Dequantize: cast fp8 → bf16 then apply inverse scale.
-            bf16_grad = fp8_grad_cpu.to(param.dtype).div_(scale_cpu)
-            param.grad = bf16_grad
 
     def _init_sub_optimizers(self):
         (
@@ -455,26 +270,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for param in group["params"]:
                 orig_param = param
                 cpu_copy = False
-
-                if is_float8tensor(orig_param):
-                    # FP8 param: dequantize to master dtype (bf16 or fp32).
-                    # Float8Tensor.float() performs proper FP8 → fp32 dequantization.
-                    master = orig_param.float().to(self._master_dtype).detach().clone()
-                    if offload_params_numel < offload_threshold:
-                        param = self._alloc_cpu_tensor(master)
-                        offload_params_numel += param.numel()
-                        cpu_copy = True
-                    else:
-                        param = master
+                if offload_params_numel < offload_threshold and param.is_cuda:
+                    param = param.detach().clone().cpu().pin_memory()
+                    offload_params_numel += param.numel()
+                    cpu_copy = True
+                if self.param_update_in_fp32 and param.dtype != torch.float32:
+                    param = param.detach().clone().float()
                     param_to_fp32_param[orig_param] = param
-                else:
-                    if offload_params_numel < offload_threshold and param.is_cuda:
-                        param = self._alloc_cpu_tensor(param.detach().clone())
-                        offload_params_numel += param.numel()
-                        cpu_copy = True
-                    if self._master_dtype is not None and param.dtype != self._master_dtype:
-                        param = param.detach().clone().to(self._master_dtype)
-                        param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
                     gpu_params_map_cpu_copy[orig_param] = param

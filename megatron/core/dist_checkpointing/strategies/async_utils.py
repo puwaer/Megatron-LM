@@ -16,8 +16,6 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 import torch
 from torch import multiprocessing as mp
 
-from megatron.core.utils import log_single_rank
-
 from ..utils import debug_time
 
 logger = logging.getLogger(__name__)
@@ -169,7 +167,7 @@ class AsyncCaller(ABC):
     @abstractmethod
     def close(self, abort=False):
         """Terminate the async caller at exit of an application or some termination conditions"""
-        logger.debug(f"AsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller")
+        logger.info(f"AsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller")
 
     def __del__(self):
         raise NotImplementedError("This should be implemented")
@@ -267,11 +265,7 @@ class TemporalAsyncCaller(AsyncCaller):
         if self.process:
             logger.debug(f"rank: {torch.distributed.get_rank()}, joining self.process")
             if abort:
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Temporal worker aborted in rank {torch.distributed.get_rank()}",
-                )
+                logger.warning(f"Temporal worker aborted in rank {torch.distributed.get_rank()}")
                 self.process.kill()
             else:
                 self.process.join()
@@ -325,7 +319,7 @@ class PersistentAsyncCaller(AsyncCaller):
         self.start_time = time()
         if self.process is None:
             ctx = mp.get_context('spawn')
-            logger.debug(
+            logger.info(
                 f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Starting Async Caller"
             )
             self.process: mp.Process = ctx.Process(
@@ -339,7 +333,7 @@ class PersistentAsyncCaller(AsyncCaller):
                 ),
             )
             self.process.start()
-            logger.debug(
+            logger.info(
                 f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Started Async Caller"
             )
 
@@ -425,16 +419,12 @@ class PersistentAsyncCaller(AsyncCaller):
             abort (bool, optional): Default to False. Needs to be manually set to true when
                 the checkpoint async process needs to be aborted.
         """
-        logger.debug(
+        logger.info(
             f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller"
         )
         if self.process:
             if abort:
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Persistent worker aborted in rank {torch.distributed.get_rank()}",
-                )
+                logger.warning(f"Persistent worker aborted in rank {torch.distributed.get_rank()}")
                 self.process.kill()
             else:
                 self.queue.put('DONE')
@@ -476,18 +466,9 @@ class PersistentAsyncCaller(AsyncCaller):
                                        to get aligned with the training rank's logging level
 
         """
-        # Set logger.
         logger = logging.getLogger(__name__)
         logger.setLevel(log_level)
-        logger.debug(f"PersistentAsyncCaller: persistent ckpt worker for {rank} has started")
-
-        # Set CUDA device to appropriate local_rank to ensure allocations / CUDA contexts
-        # in this new process are on the right device, and device 0 on the node does not
-        # take on undue memory burden from other devices on node (default behavior without
-        # this line).
-        torch.cuda.set_device(rank % torch.cuda.device_count())
-
-        # Start busy loop waiting for and executing checkpoint saves.
+        logger.info(f"PersistentAsyncCaller: persistent ckpt worker for {rank} has started")
         while True:
             item = queue.get()
             if isinstance(item, str) and item == 'DONE':
@@ -506,7 +487,7 @@ class PersistentAsyncCaller(AsyncCaller):
                 comp_q.put(item.call_idx)
                 queue.task_done()
 
-        logger.debug(f"PersistentAsyncCaller: persistent ckpt worker for {rank}  has terminated")
+        logger.info(f"PersistentAsyncCaller: persistent ckpt worker for {rank}  has terminated")
 
 
 class _ActiveAsyncRequest(NamedTuple):

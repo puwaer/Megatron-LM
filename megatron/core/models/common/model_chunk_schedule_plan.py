@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
 from typing import Optional
@@ -8,6 +8,9 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    fine_grained_offloading_set_last_layer,
+)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -34,20 +37,23 @@ class TransformerLayerSchedulePlan:
     mtp post process nodes.
 
     layer (TransformerLayerSchedulePlan)
-    ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
+    ├── attn (TransformerLayerNode): attention module
+    ├── post_attn (TransformerLayerNode): layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
     └── mtp_post_process (PostProcessNode): mtp post process
 
     Note that MTP layer has the same operation and execution order with TransformerLayer regarding
-    moe_dispatch, mlp, moe_combine, but contains extra operations in attn and mtp_post_process:
+    post_attn, moe_dispatch, mlp, moe_combine, but contains extra operations in attn and
+    mtp_post_process:
     * mtp.attn wraps around transformer_layer.attn with extra norm, proj and embedding operations.
     * mtp.mtp_post_process contains output_layer, mtp loss operations, whereas
       transformer_layer.mtp_post_process is empty.
     """
 
     attn = None
+    post_attn = None
     moe_dispatch = None
     mlp = None
     moe_combine = None
@@ -71,7 +77,6 @@ class TransformerLayerSchedulePlan:
         """
         from megatron.core.models.gpt.fine_grained_callables import TransformerLayerState
 
-        self.config = layer.config
         self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
         self.layer = layer
@@ -82,33 +87,10 @@ class TransformerLayerSchedulePlan:
         # get callable nodes for transformer/mtp layer
         self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
 
-    def release_state(self):
-        """Release reference, this helps avoid memory leak."""
-        if hasattr(self, 'attn') and self.attn is not None:
-            del self.attn
-            self.attn = None
-        if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
-            del self.moe_dispatch
-            self.moe_dispatch = None
-        if hasattr(self, 'mlp') and self.mlp is not None:
-            del self.mlp
-            self.mlp = None
-        if hasattr(self, 'moe_combine') and self.moe_combine is not None:
-            del self.moe_combine
-            self.moe_combine = None
-        if hasattr(self, 'mtp_post_process') and self.mtp_post_process is not None:
-            del self.mtp_post_process
-            self.mtp_post_process = None
-        if hasattr(self, 'layer_state') and self.layer_state is not None:
-            del self.layer_state
-            self.layer_state = None
-        if hasattr(self, 'layer'):
-            del self.layer
-
     def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
-            attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
+            attn, post_attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
         """
         from megatron.core.models.gpt.fine_grained_callables import (
             TransformerLayerNode,
@@ -122,13 +104,18 @@ class TransformerLayerSchedulePlan:
 
         # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
-        transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
-        is_moe = isinstance(transformer_layer.mlp, MoELayer)
-        num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
+        is_moe = (
+            isinstance(self.layer.transformer_layer.mlp, MoELayer)
+            if is_mtp
+            else isinstance(self.layer.mlp, MoELayer)
+        )
 
-        extra_args["config"] = self.layer.config
+        enable_deepep = (
+            self.layer.config.moe_token_dispatcher_type == "flex"
+            and self.layer.config.moe_flex_dispatcher_backend == "deepep"
+        )
+        extra_args["enable_deepep"] = enable_deepep
         extra_args["is_moe"] = is_moe
-        extra_args["num_local_experts"] = num_local_experts
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
         extra_args["is_mtp"] = is_mtp
 
@@ -148,6 +135,7 @@ class TransformerLayerSchedulePlan:
 
         (
             attn_module,
+            post_attn_module,
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
@@ -159,9 +147,11 @@ class TransformerLayerSchedulePlan:
         self.attn = create_node(comp_stream, attn_module, "attn")
         self.mlp = create_node(comp_stream, mlp_module, "mlp")
         if is_moe:
+            self.post_attn = create_node(comp_stream, post_attn_module, "post_attn")
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
             self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
         else:
+            self.post_attn = NoopScheduleNode()
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
 
@@ -194,8 +184,8 @@ class TransformerLayerSchedulePlan:
         to maximize parallelism and efficiency.
 
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
-        comm_stream: combine_bwd | dispatch_fwd->dispatch_bwd  | combine_fwd
-        comp_stream: attn_fwd    | mlp_bwd->mlp_bwd_dw->mlp_fwd| attn_bwd
+        comm_stream: combine_bwd            | dispatch_fwd->dispatch_bwd  | combine_fwd
+        comp_stream: attn_fwd->post_attn_fwd| mlp_bwd->mlp_bwd_dw->mlp_fwd| post_attn_bwd->attn_bwd
         For MTP, mtp_post_process_fwd is executed after the combine_fwd in the comp_stream,
         and mtp_post_process_bwd is executed before the combine_bwd in the comp_stream.
 
@@ -218,6 +208,7 @@ class TransformerLayerSchedulePlan:
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.attn.forward(f_input)
+                f_input = f_layer.post_attn.forward(f_input)
 
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
@@ -230,9 +221,6 @@ class TransformerLayerSchedulePlan:
             b_layer.mlp.backward_dw()
             b_grad = b_layer.moe_dispatch.backward(b_grad)
 
-        if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
-            b_grad = b_layer.attn.backward(b_grad)
-
         if f_layer is not None:
             with f_layer.get_fp8_context():
                 f_input = f_layer.mlp.forward(f_input)
@@ -242,7 +230,8 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.moe_combine.forward(f_input)
                 f_input = f_layer.mtp_post_process.forward(f_input)
 
-        if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
+        if b_layer is not None:
+            b_grad = b_layer.post_attn.backward(b_grad)
             b_grad = b_layer.attn.backward(b_grad)
 
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
@@ -280,7 +269,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         extra_block_kwargs=None,
         runtime_gather_output: Optional[bool] = None,
         loss_mask: Optional[Tensor] = None,
-        padding_mask=None,
     ):
         """Initialize the schedule plan of all Transformer layers' sub-modules.
 
@@ -323,7 +311,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.mtp_hidden_states = None
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
-        self._model_chunk_state.padding_mask = padding_mask
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
         self._model_chunk_state.runtime_gather_output = runtime_gather_output
         self._model_chunk_state.model = model
@@ -384,10 +371,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         """Gets the transformer layer at the specified index."""
         assert i < self.num_layers()
         return self._transformer_layers[i]
-
-    def pop_layer(self):
-        """Pops the transformer layer in FILO order."""
-        return self._transformer_layers.pop()
 
     def num_layers(self):
         """Gets the number of transformer layers."""
@@ -467,12 +450,13 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
         overlapped_layers = min(f_num_layers, b_num_layers)
 
-        f_layer = b_layer = None
         # combined forward and backward pass for overlapped layers
         for i in range(overlapped_layers):
             f_layer = f_schedule_plan.get_layer(i)
-            b_layer = b_schedule_plan.pop_layer()
-            torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b")
+            b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
+            torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_num_layers - 1 - i}b")
+            if f_layer.layer.config.fine_grained_activation_offloading:
+                fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
                 b_layer,
@@ -480,25 +464,23 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 b_grad=b_grad,
                 is_last_layer_in_bwd=(i == b_num_layers - 1),
             )
-            if i < b_num_layers - 1:
-                b_layer.release_state()
             torch.cuda.nvtx.range_pop()
 
         # backward pass for the remaining layers
         for i in range(overlapped_layers, b_num_layers):
-            b_layer = b_schedule_plan.pop_layer()
-            torch.cuda.nvtx.range_push(f"layer_{b_schedule_plan.num_layers()}b")
+            b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
+            torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
             _, b_grad = TransformerLayerSchedulePlan.run(
                 None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
             )
-            if i < b_num_layers - 1:
-                b_layer.release_state()
             torch.cuda.nvtx.range_pop()
 
         # forward pass for the remaining layers
         for i in range(overlapped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
             torch.cuda.nvtx.range_push(f"layer_{i}f")
+            if f_layer.layer.config.fine_grained_activation_offloading:
+                fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
             torch.cuda.nvtx.range_pop()
 
@@ -518,9 +500,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # Delay the last attn_dw in backward pass (attn_dw of the first layer)
         # for overlapping with the p2p comm
         if b_num_layers > 0:
-            assert b_layer is not None
-            b_layer.attn.backward_dw()
-            b_layer.release_state()
+            b_schedule_plan.get_layer(0).attn.backward_dw()
 
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
@@ -533,7 +513,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_schedule_plan.wait_current_stream()
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
-            # Release reference as early as possible, this helps avoid memory leak.
+
+        # Release reference as early as possible, this helps avoid memory leak.
+        if b_schedule_plan is not None:
             b_schedule_plan.release_state()
 
         return f_input

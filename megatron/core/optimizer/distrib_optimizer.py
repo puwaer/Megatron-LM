@@ -5,7 +5,6 @@
 
 import gc
 import itertools
-import logging
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -13,8 +12,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional
-
-from megatron.core.utils import log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -601,9 +598,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
-                params=[g["orig_group"] for g in self.opt_group_ranges],
-                data_parallel_group=self.data_parallel_group,
-                **self.optimizer.defaults,
+                params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
             )
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
@@ -845,32 +840,24 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    '***WARNING*** found an old checkpoint, will not load grad scaler ...',
+                logger.info(
+                    '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
                 )
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
             else:
-                log_single_rank(
-                    logger,
-                    logging.INFO,
+                logger.info(
                     '***WARNING*** fould the grad scaler in the '
                     'checkpoint but it is None in the class. '
-                    'Skipping loading grad scaler ...',
+                    'Skipping loading grad scaler ...'
                 )
 
         if 'param_state' in state_dict:
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
             param_state = state_dict['param_state']
             sharding_type = state_dict['param_state_sharding_type']
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f'Loading distributed optimizer sharded state of type {sharding_type}',
-            )
+            logger.info(f'Loading distributed optimizer sharded state of type {sharding_type}')
             if sharding_type == 'dp_zero_gather_scatter':
                 self.load_parameter_state_from_dp_zero(param_state)
             elif sharding_type == 'fully_reshardable':
@@ -903,12 +890,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 tensors[k] = self.optimizer.get_unscaled_state(sharded_model_param, k)
-            if "master_param" in tensors:
-                tensors["param"] = tensors.pop("master_param")
-            else:
-                # bf16 direct update mode (TE >= 2.1.0 with main_params_dtype=bf16):
-                # no separate master copy; sharded_model_param IS the param to checkpoint.
-                tensors["param"] = sharded_model_param
+            tensors["param"] = tensors.pop("master_param")
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
@@ -936,12 +918,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
 
                 if k == "param":
-                    param_state = self.optimizer.state.get(sharded_model_param, {})
-                    if "master_param" in param_state:
-                        self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
-                    else:
-                        # bf16 direct update mode: no master_param; restore directly.
-                        sharded_model_param.data.copy_(v)
+                    self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
         else:
@@ -1225,12 +1202,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
         if sharding_type is not None:
-            log_single_rank(
-                logger,
-                logging.WARNING,
+            logger.warning(
                 'DistributedOptimizer.sharded_state_dict parameter `sharding_type`'
                 ' is deprecated and will be removed.'
-                ' Use `metadata["distrib_optim_sharding_type"] instead`.',
+                ' Use `metadata["distrib_optim_sharding_type"] instead`.'
             )
         else:
             sharding_type = (metadata or {}).get(
@@ -1247,12 +1222,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return state_dict
 
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':
-            log_single_rank(
-                logger,
-                logging.WARNING,
+            logger.warning(
                 '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
                 ' checkpoint is deprecated and will be removed in the future.'
-                ' Please switch to `full_sharded_model_space`.',
+                ' Please switch to `full_sharded_model_space`.'
             )
 
         state_dict = self.state_dict()
@@ -1671,11 +1644,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         for key in tensors:
                             if key == 'padding':
-                                tensors[key] = LocalNonpersistentObject(tensors[key])
-                                continue
-                            if key == 'step':
-                                # The optimizer state of STEP is a 0-dim tensor and is handled
-                                # separately via param_groups, not as part of the gradient buffer.
                                 tensors[key] = LocalNonpersistentObject(tensors[key])
                                 continue
                             assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
@@ -2385,10 +2353,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     if is_float8tensor(model_param):
                         param_range_map = self._get_model_param_range_map(model_param)
                         param_range = param_range_map["param"]
-                        # shard_main_param is None when use_precision_aware_optimizer
-                        # is True (main params held by the optimizer, e.g. HDO).
-                        if shard_main_param is not None:
-                            assert param_range.size == shard_main_param.nelement()
+                        assert param_range.size == shard_main_param.nelement()
                         idx = fp8_param_to_idx_map[model_param]
                         shard_fp32_from_fp8[idx] = shard_main_param
                         shard_offsets_in_fp8[idx] = param_range.start
@@ -2397,52 +2362,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         get_shard_fp32_from_fp8(self.shard_fp32_groups, self.model_fp32_groups)
 
         return fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
-
-    def _quantize_fp8_from_hdo_masters(self):
-        """Quantize updated HDO bf16 masters back to FP8 model param buffers.
-
-        Called from _copy_main_params_to_model_params when CPU offload is active.
-        Uses the full fp8_params list (same across all DP ranks) so that the
-        all_reduce inside quantize_param_shard has a consistent element count.
-
-        HDO stores bf16 masters keyed by the FP8 shard-view tensors
-        (model_param.view(-1)[start:end]).  We match those to the full model
-        params via shard_float16_groups / model_float16_groups.
-        """
-        fp8_params, _, offsets = self._get_fp8_params_and_shard_fp32_from_fp8()
-        if not fp8_params:
-            return
-
-        hdo = self.optimizer
-
-        # Build: full FP8 model param → shard view (same object HDO received as orig_param)
-        fp8_id_to_shard_view = {}
-        for shard_group, model_group in zip(
-            self.shard_float16_groups, self.model_float16_groups
-        ):
-            for shard_view, model_param in zip(shard_group, model_group):
-                if is_float8tensor(model_param) and shard_view is not None:
-                    fp8_id_to_shard_view[id(model_param)] = shard_view
-
-        # Replace None shard_mains with HDO's updated bf16 masters (moved to GPU).
-        shard_mains = []
-        for fp8_param, offset in zip(fp8_params, offsets):
-            if offset is None:
-                # This DP rank holds no shard of this param.
-                shard_mains.append(None)
-                continue
-            shard_view = fp8_id_to_shard_view.get(id(fp8_param))
-            master = None
-            if shard_view is not None:
-                master = hdo.param_to_fp32_param.get(shard_view)
-            if master is not None:
-                if not master.is_cuda:
-                    master = master.to(fp8_param.device)   # blocking H2D
-                shard_mains.append(master)
-            else:
-                shard_mains.append(None)
-
-        quantize_param_shard(fp8_params, shard_mains, offsets, self.data_parallel_group)
 
     def _copy_model_grads_to_main_grads(self):
         """
@@ -2506,11 +2425,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-            # For CPU-offload (HybridDeviceOptimizer), FP8 params are NOT quantized by the
-            # optimizer's copy-back hooks (to avoid per-rank all_reduce count mismatch).
-            # Handle them here where all DP ranks use the same full fp8_params list.
-            if isinstance(self.optimizer, HybridDeviceOptimizer):
-                self._quantize_fp8_from_hdo_masters()
             return
 
         quantize_param_shard(

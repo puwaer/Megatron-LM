@@ -2,7 +2,6 @@
 
 """Megatron timers."""
 
-import logging
 import time
 from abc import ABC, abstractmethod
 from typing import List
@@ -28,8 +27,6 @@ try:
         dist_all_gather_func = torch.distributed._all_gather_base
 except:
     dist_all_gather_func = torch.distributed._all_gather_base
-
-logger = logging.getLogger(__name__)
 
 
 class TimerBase(ABC):
@@ -173,17 +170,6 @@ class Timer(TimerBase):
         # Don't reset _active_time
         self._elapsed = 0.0
         self._started = False
-
-    def set_elapsed(self, value):
-        """Directly set the elapsed time.
-
-        This is useful for injecting pre-computed timing values (e.g., startup
-        timestamps) into the timer so they can be reported via timers.log().
-
-        Args:
-            value (float): The elapsed time value in seconds.
-        """
-        self._elapsed = value
 
     def elapsed(self, reset=True, barrier=False):
         """Calculates the elapsed time and restarts timer.
@@ -447,7 +433,7 @@ class Timers:
         if rank is None:
             rank = torch.distributed.get_world_size() - 1
         if rank == torch.distributed.get_rank() and output_string is not None:
-            logger.info(output_string)
+            print(output_string, flush=True)  # pylint: disable=W0141
 
     def write(
         self,

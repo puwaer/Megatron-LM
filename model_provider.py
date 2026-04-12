@@ -22,7 +22,7 @@ import megatron.legacy.model  # isort: skip
 
 
 def model_provider(
-    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
+    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]:
     """Builds the model.
 
@@ -50,9 +50,13 @@ def model_provider(
         def oom_observer(device, alloc, device_alloc, device_free):
             # snapshot right after an OOM happened
             print('saving allocated state during OOM')
+            snapshot = torch.cuda.memory._snapshot()
+            from pickle import dump
 
-            filename = f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}"
-            torch.cuda.memory._dump_snapshot(filename)
+            dump(
+                snapshot,
+                open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'),
+            )
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
@@ -60,7 +64,7 @@ def model_provider(
         # [ModelOpt]: Use custom builder + spec when modelopt is enabled
         model_builder = modelopt_gpt_mamba_builder
 
-    return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
+    return model_builder(args, pre_process, post_process, vp_stage)
 
 
 def count_parameters_in_layer(model, layer_name):
