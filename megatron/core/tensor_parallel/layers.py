@@ -567,7 +567,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # In case of Megatron-FSDP, need to create main grad buffers in-place
                 if hasattr(weight, "__fsdp_param__"):
                     weight.main_grad = weight.get_main_grad()
-                    torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
+                    if weight.main_grad.dtype == grad_output.dtype:
+                        torch.matmul(grad_output.t(), total_input, out=weight.main_grad)
+                    else:
+                        # dtype mismatch (e.g. float32 main_grad with bf16 compute):
+                        # compute in compute dtype then copy with cast into main_grad.
+                        weight.main_grad.copy_(torch.matmul(grad_output.t(), total_input))
                 else:
                     if weight.main_grad.dtype == torch.float32:
                         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(

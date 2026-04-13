@@ -3500,7 +3500,7 @@ def _add_experimental_args(parser):
                        'fp16, bf16 and fp8.')
     group.add_argument('--main-grads-dtype', default='fp32', choices=['fp32', 'bf16'],
                        help='Dtype of main grads when enabling precision-aware-optimizer')
-    group.add_argument('--main-params-dtype', default='fp32', choices=['fp32', 'fp16'],
+    group.add_argument('--main-params-dtype', default='fp32', choices=['fp32', 'fp16', 'bf16', 'fp8'],
                        help='Dtype of main params when enabling precision-aware-optimizer')
     group.add_argument('--exp-avg-dtype', default='fp32', choices=['fp32', 'fp16', 'bf16', 'fp8'],
                        help='Dtype of exp_avg (1st moment in adam optimizer) when enabling '

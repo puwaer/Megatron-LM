@@ -312,7 +312,8 @@ def _get_megatron_optimizer_based_on_param_groups(
                 overlap_cpu_optimizer_d2h_h2d=config.overlap_cpu_optimizer_d2h_h2d,
                 pin_cpu_grads=config.pin_cpu_grads,
                 pin_cpu_params=config.pin_cpu_params,
-                param_update_in_fp32=True,
+                param_update_in_fp32=False,
+                param_update_dtype=config.main_params_dtype,
                 **optimizer_defaults,
             )
             init_state_fn = None
@@ -346,16 +347,31 @@ def _get_megatron_optimizer_based_on_param_groups(
                 # Delayed scaling is an exception because casting as well as the computation
                 # of the scaling factor can be conducted in the adam kernel.
                 if config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                    kwargs.update(
-                        {
-                            "master_weights": True,
-                            "use_decoupled_grad": True,
-                            "master_weight_dtype": config.main_params_dtype,
-                        }
-                    )
+                    # TE FusedAdam does not support master_weight_dtype=bfloat16.
+                    # When store_param_remainders=True with bf16 params, FusedAdam
+                    # recovers precision via remainders instead of separate master weights.
+                    if config.store_param_remainders and config.main_params_dtype == torch.bfloat16:
+                        kwargs.update({"use_decoupled_grad": True})
+                    else:
+                        kwargs.update(
+                            {
+                                "master_weights": True,
+                                "use_decoupled_grad": True,
+                                "master_weight_dtype": config.main_params_dtype,
+                            }
+                        )
 
                 if is_te_min_version("2.1.0.dev0"):
-                    kwargs.update({"store_param_remainders": config.store_param_remainders})
+                    # In the bf16-without-master-weights path, disable store_param_remainders
+                    # to avoid ~2*num_params bytes of fp32 remainder storage (e.g., 8 GB for
+                    # a 2B model). Parameter updates use direct bf16 arithmetic instead.
+                    bf16_no_master_weights = (
+                        config.main_params_dtype == torch.bfloat16
+                        and not kwargs.get("master_weights", False)
+                    )
+                    kwargs.update({
+                        "store_param_remainders": config.store_param_remainders and not bf16_no_master_weights
+                    })
 
             optimizer = adam_cls(**kwargs)
 

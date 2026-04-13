@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import torch
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -127,9 +129,15 @@ class DistributedDataParallelConfig:
 
     disable_symmetric_registration: bool = False
     """If true, disable symmetric (window) registration for NCCL userbuffer registration.
-      This option will force to use conventional (local) userbuffer registration 
+      This option will force to use conventional (local) userbuffer registration
       when nccl_ub is set.
     """
+
+    main_params_dtype: torch.dtype = torch.float32
+    """dtype for the main weight buffer in FSDP. Set to torch.bfloat16 to save memory."""
+
+    use_precision_aware_optimizer: bool = False
+    """If true, set param.decoupled_grad instead of param.grad in update_main_grads."""
 
     def __post_init__(self):
         import os

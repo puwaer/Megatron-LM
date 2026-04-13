@@ -1885,6 +1885,9 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
+    # Release cached CUDA memory before checkpoint save to prevent OOM during
+    # NCCL all_gather_object in FullyParallelSaveStrategyWrapper.
+    torch.cuda.empty_cache()
     save_checkpoint(
         iteration,
         model,
@@ -1901,6 +1904,10 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
+    # Release cached CUDA memory that may remain after distributed checkpoint
+    # saving (e.g. temporary tensors from all_gather_object in fully_parallel
+    # checkpoint strategy).
+    torch.cuda.empty_cache()
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)

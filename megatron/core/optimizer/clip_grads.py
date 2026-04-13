@@ -171,10 +171,17 @@ def clip_grad_by_total_norm_fp32(
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
-        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
-        multi_tensor_applier(
-            multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
-        )
+        if not grads:
+            return
+        if any(g.dtype != torch.float32 for g in grads):
+            # multi_tensor_scale_cuda only supports FP32; fall back to PyTorch native scaling.
+            for g in grads:
+                g.mul_(clip_coeff)
+        else:
+            dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+            multi_tensor_applier(
+                multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+            )
 
 
 def count_zeros_fp32(

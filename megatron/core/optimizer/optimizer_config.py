@@ -220,6 +220,18 @@ class OptimizerConfig:
     def __post_init__(self):
         """Check the validity of the config."""
 
+        # Convert string dtype values (e.g. from YAML/Hydra configs) to torch.dtype.
+        _dtype_map = {
+            'fp32': torch.float32,
+            'bf16': torch.bfloat16,
+            'fp16': torch.float16,
+            'fp8': torch.uint8,
+        }
+        for _attr in ('main_grads_dtype', 'main_params_dtype', 'exp_avg_dtype', 'exp_avg_sq_dtype'):
+            _val = getattr(self, _attr)
+            if isinstance(_val, str):
+                setattr(self, _attr, _dtype_map[_val])
+
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are
         # different for different training precision settings. FP8 cases require different

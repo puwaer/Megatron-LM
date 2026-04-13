@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+import torch
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -139,6 +141,9 @@ class DistributedDataParallelConfig:
 
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
+    main_params_dtype: torch.dtype = torch.float32
+    """dtype for the main weight buffer in FSDP. Set to torch.bfloat16 to save memory."""
 
     def __post_init__(self):
         import os
