@@ -1975,6 +1975,10 @@ try:
         double_buffering,
     ):
         """Get CPU offload context and sync function."""
+        if not enabled:
+            import contextlib
+            return contextlib.nullcontext(), None
+
         if is_te_min_version("2.5.0"):
             # Enables the additional double buffering switch for activations during LLM training
             context, sync_func = _get_cpu_offload_context(
