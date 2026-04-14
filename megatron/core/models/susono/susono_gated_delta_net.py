@@ -293,11 +293,16 @@ class SusonoGatedDeltaNet(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
-        # Select compute kernels
-        self._causal_conv1d_update = causal_conv1d_update or _torch_causal_conv1d_update
+        # Select compute kernels.
+        # Kernel functions can still be unavailable/unsupported at runtime
+        # (e.g., CPU execution or unsupported dtype), so forward() re-checks.
+        self._causal_conv1d_update_kernel = causal_conv1d_update
+        self._causal_conv1d_update_fallback = _torch_causal_conv1d_update
         self._causal_conv1d_fn = causal_conv1d_fn
-        self._chunk_fn  = chunk_gated_delta_rule   or _chunk_gated_delta_rule
-        self._recur_fn  = fused_recurrent_gated_delta_rule or _recurrent_gated_delta_rule
+        self._chunk_kernel = chunk_gated_delta_rule
+        self._chunk_fallback = _chunk_gated_delta_rule
+        self._recur_kernel = fused_recurrent_gated_delta_rule
+        self._recur_fallback = _recurrent_gated_delta_rule
 
     # ------------------------------------------------------------------
     # Helpers
@@ -377,9 +382,16 @@ class SusonoGatedDeltaNet(nn.Module):
         v_flat = v.reshape(B, S, -1)
         mixed_qkv = torch.cat([q_flat, k_flat, v_flat], dim=-1).transpose(1, 2)  # [B, conv_dim, S]
 
+        use_kernel_path = mixed_qkv.is_cuda and mixed_qkv.dtype in (torch.float16, torch.bfloat16)
+        causal_conv_update = (
+            self._causal_conv1d_update_kernel
+            if use_kernel_path and self._causal_conv1d_update_kernel is not None
+            else self._causal_conv1d_update_fallback
+        )
+
         # Causal convolution
         if is_inference_step:
-            mixed_qkv = self._causal_conv1d_update(
+            mixed_qkv = causal_conv_update(
                 mixed_qkv,
                 inference_cache.conv_state,
                 self.conv1d.weight.squeeze(1),
@@ -390,7 +402,7 @@ class SusonoGatedDeltaNet(nn.Module):
                 inference_cache.conv_state = F.pad(
                     mixed_qkv, (self.conv_kernel - S, 0)
                 )
-            if self._causal_conv1d_fn is not None:
+            if use_kernel_path and self._causal_conv1d_fn is not None:
                 mixed_qkv = self._causal_conv1d_fn(
                     x=mixed_qkv,
                     weight=self.conv1d.weight.squeeze(1),
@@ -419,16 +431,19 @@ class SusonoGatedDeltaNet(nn.Module):
             q = q.repeat_interleave(ratio, dim=2)
             k = k.repeat_interleave(ratio, dim=2)
 
+        chunk_fn = self._chunk_kernel if (use_kernel_path and self._chunk_kernel is not None) else self._chunk_fallback
+        recur_fn = self._recur_kernel if (use_kernel_path and self._recur_kernel is not None) else self._recur_fallback
+
         # Recurrence
         if not is_inference_step:
-            core_out, final_state = self._chunk_fn(
+            core_out, final_state = chunk_fn(
                 q, k, v, g=g, beta=beta,
                 initial_state=None,
                 output_final_state=(inference_cache is not None),
                 use_qk_l2norm_in_kernel=True,
             )
         else:
-            core_out, final_state = self._recur_fn(
+            core_out, final_state = recur_fn(
                 q, k, v, g=g, beta=beta,
                 initial_state=inference_cache.recurrent_state,
                 output_final_state=True,

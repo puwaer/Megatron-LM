@@ -82,6 +82,7 @@ class MHCTransformerLayer(TransformerLayer):
                 layer_index=layer_number,
                 sinkhorn_iterations=config.mhc_sinkhorn_iterations,
                 use_fused_kernel=getattr(config, 'mhc_use_fused_kernel', False),
+                auto_use_fused_kernel=getattr(config, 'mhc_auto_use_fused_kernel', True),
             )
 
         # Engram module — None for layers where Engram is not applied

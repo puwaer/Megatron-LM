@@ -112,6 +112,7 @@ class SusonoLinearAttentionDecoderLayer(MegatronModule):
                 layer_index=self.layer_number,
                 sinkhorn_iterations=config.mhc_sinkhorn_iterations,
                 use_fused_kernel=getattr(config, 'mhc_use_fused_kernel', False),
+                auto_use_fused_kernel=getattr(config, 'mhc_auto_use_fused_kernel', True),
             )
 
         # Engram module — attached externally by SusonoBlock

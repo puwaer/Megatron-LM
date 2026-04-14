@@ -35,6 +35,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+try:
+    from causal_conv1d import causal_conv1d_fn
+except ImportError:
+    causal_conv1d_fn = None
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -71,7 +76,7 @@ class EngramConfig:
     """Embedding dimension for each entry in the multi-head embedding table."""
 
     n_head_per_ngram: int = 8
-    engram_layer_ids: List[int] = field(default_factory=lambda: [0, 14])
+    engram_layer_ids: List[int] = field(default_factory=lambda: [3, 7])
     seed: int = 0
     base_vocab_size: int = 129280
 
@@ -344,9 +349,24 @@ class ShortConv(nn.Module):
         """
         # Conv1d expects [B, C, S]
         x = x.permute(0, 2, 1)
-        x = self.conv(x)
-        # Trim extra padding to keep length S
-        if self._trim is not None:
+        use_causal_conv_kernel = (
+            causal_conv1d_fn is not None
+            and x.is_cuda
+            and x.dtype in (torch.float16, torch.bfloat16)
+        )
+        if use_causal_conv_kernel:
+            x = causal_conv1d_fn(
+                x=x,
+                weight=self.conv.weight.squeeze(1),
+                bias=self.conv.bias,
+                activation=None,
+                seq_idx=None,
+            )
+        else:
+            x = self.conv(x)
+        # nn.Conv1d path uses explicit left padding (kernel_size-1), so trim back to S.
+        # causal_conv1d_fn already preserves sequence length, so no trim is needed there.
+        if self._trim is not None and not use_causal_conv_kernel:
             x = x[..., :self._trim]
         return x.permute(0, 2, 1)
 

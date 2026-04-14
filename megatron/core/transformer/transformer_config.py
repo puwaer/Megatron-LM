@@ -958,6 +958,11 @@ class TransformerConfig(ModelParallelConfig):
     HBM round-trips for these intermediates.  Falls back to PyTorch when Triton
     is unavailable, the device is CPU, or n != 4.  Requires bfloat16."""
 
+    mhc_auto_use_fused_kernel: bool = True
+    """When True, automatically enable the fused mHC width-connection kernel when
+    runtime conditions match (CUDA + bfloat16 + n=4). If False, only
+    mhc_use_fused_kernel=True will try the fused path."""
+
     mhc_async_pp_overlap: bool = False
     """When True, run mHC width and depth connections on a dedicated high-priority
     CUDA stream to enable overlap with pipeline-parallel (PP) P2P communication.

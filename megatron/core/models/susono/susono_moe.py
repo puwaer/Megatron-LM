@@ -392,7 +392,12 @@ class SusonoRoutedExperts(nn.Module):
         if N == 0:
             return torch.zeros_like(tokens)
 
-        if _HAVE_GROUPED_GEMM:
+        can_use_grouped_gemm = (
+            _HAVE_GROUPED_GEMM
+            and tokens.is_cuda
+            and tokens.dtype in (torch.float16, torch.bfloat16)
+        )
+        if can_use_grouped_gemm:
             return self._compute_local_grouped_gemm(tokens, tokens_per_expert, weights)
         else:
             return self._compute_local_loop(tokens, local_ids, weights)

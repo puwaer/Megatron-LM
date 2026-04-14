@@ -114,11 +114,13 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         layer_index: Optional[int] = None,
         sinkhorn_iterations: int = 20,   # unused, kept for API compat
         use_fused_kernel: bool = False,
+        auto_use_fused_kernel: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.num_streams = num_streams
         self.use_fused_kernel = use_fused_kernel
+        self.auto_use_fused_kernel = auto_use_fused_kernel
         n = num_streams
         num_perms = math.factorial(n)
         self.num_perms = num_perms
@@ -187,7 +189,13 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         n, S, B, D = X.shape
         perms = _get_permutation_matrices(n, X.device, X.dtype)  # [n!, n, n], dtype-cached
 
-        if self.use_fused_kernel:
+        auto_fused_eligible = (
+            self.auto_use_fused_kernel
+            and X.is_cuda
+            and X.dtype == torch.bfloat16
+            and n == 4
+        )
+        if self.use_fused_kernel or auto_fused_eligible:
             from megatron.core.fusions.fused_mhc_width_connection import (
                 fused_mhc_width_connection,
             )
