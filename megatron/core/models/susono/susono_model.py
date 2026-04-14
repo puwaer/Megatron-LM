@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""FujiModel: GPT-style language model with mHC and Engram.
+"""SusonoModel: GPT-style language model with mHC and Engram.
 
-FujiModel extends GPTModel with two architectural improvements from DeepSeek-AI:
+SusonoModel extends GPTModel with two architectural improvements from DeepSeek-AI:
 
   1. **mHC (Manifold-Constrained Hyper-Connections)** — replaces standard
      single-stream residual connections with n parallel streams constrained via
@@ -14,8 +14,8 @@ FujiModel extends GPTModel with two architectural improvements from DeepSeek-AI:
 Usage example (standalone)::
 
     from megatron.core.transformer.transformer_config import TransformerConfig
-    from megatron.core.models.fuji.fuji_model import FujiModel
-    from megatron.core.models.fuji.fuji_layer_specs import get_fuji_layer_spec
+    from megatron.core.models.susono.susono_model import SusonoModel
+    from megatron.core.models.susono.susono_layer_specs import get_susono_layer_spec
     from megatron.core.models.engram.engram_module import EngramConfig
     from megatron.core.models.backends import LocalSpecProvider
 
@@ -28,8 +28,8 @@ Usage example (standalone)::
         max_ngram_size=3, n_embed_per_ngram=512, n_head_per_ngram=8,
         engram_layer_ids=[0, 5],
     )
-    layer_spec = get_fuji_layer_spec(LocalSpecProvider())
-    model = FujiModel(
+    layer_spec = get_susono_layer_spec(LocalSpecProvider())
+    model = SusonoModel(
         config=config,
         transformer_layer_spec=layer_spec,
         vocab_size=50257,
@@ -44,18 +44,18 @@ from torch import Tensor
 
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.engram.engram_module import EngramConfig
-from megatron.core.models.fuji.fuji_block import FujiBlock
+from megatron.core.models.susono.susono_block import SusonoBlock
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class FujiModel(GPTModel):
+class SusonoModel(GPTModel):
     """GPT language model augmented with mHC residual streams and Engram memory.
 
-    FujiModel is a drop-in replacement for GPTModel in training and inference
-    pipelines.  It overrides the decoder construction to use FujiBlock (which
+    SusonoModel is a drop-in replacement for GPTModel in training and inference
+    pipelines.  It overrides the decoder construction to use SusonoBlock (which
     handles stream expansion/collapse internally) and passes ``input_ids`` to the
     decoder for Engram lookup.
 
@@ -63,7 +63,7 @@ class FujiModel(GPTModel):
         config:                      TransformerConfig (set use_mhc=True and/or
                                      use_engram=True to enable the new features).
         transformer_layer_spec:      Layer spec — should use MHCTransformerLayer.
-                                     See :func:`get_fuji_layer_spec`.
+                                     See :func:`get_susono_layer_spec`.
         vocab_size:                  Vocabulary size.
         max_sequence_length:         Maximum sequence length.
         pre_process:                 Whether this pipeline stage contains the embedding.
@@ -112,7 +112,7 @@ class FujiModel(GPTModel):
     ) -> None:
         # Store engram_config BEFORE calling super().__init__ so that _build_decoder
         # (called from super) can access it.
-        self._fuji_engram_config = engram_config
+        self._susono_engram_config = engram_config
 
         super().__init__(
             config=config,
@@ -135,20 +135,20 @@ class FujiModel(GPTModel):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
-        # Replace the TransformerBlock created by GPTModel.__init__ with FujiBlock.
+        # Replace the TransformerBlock created by GPTModel.__init__ with SusonoBlock.
         # Must be called AFTER super().__init__ since GPTModel builds self.decoder there.
         self._replace_decoder()
 
     def _replace_decoder(self) -> None:
-        """Replace the TransformerBlock decoder with a FujiBlock after super init."""
+        """Replace the TransformerBlock decoder with a SusonoBlock after super init."""
         # Delete the TransformerBlock built by GPTModel.__init__ to free its
-        # parameters before allocating FujiBlock (avoids doubling decoder memory).
+        # parameters before allocating SusonoBlock (avoids doubling decoder memory).
         del self.decoder
-        # Re-create the decoder as a FujiBlock using the same parameters
-        self.decoder = FujiBlock(
+        # Re-create the decoder as a SusonoBlock using the same parameters
+        self.decoder = SusonoBlock(
             config=self.config,
             spec=self.transformer_layer_spec,
-            engram_config=self._fuji_engram_config,
+            engram_config=self._susono_engram_config,
             post_layer_norm=True,
             pre_process=self.pre_process,
             post_process=self.post_process,
@@ -179,7 +179,7 @@ class FujiModel(GPTModel):
         """Forward pass.
 
         Identical to GPTModel.forward except that input_ids is also forwarded
-        to the decoder (FujiBlock) so that Engram modules can perform N-gram
+        to the decoder (SusonoBlock) so that Engram modules can perform N-gram
         memory lookup.
 
         Args:
@@ -191,10 +191,10 @@ class FujiModel(GPTModel):
         Returns:
             Loss tensor when labels is given, otherwise logits [S, B, vocab].
         """
-        # Inject input_ids into extra_block_kwargs for FujiBlock
-        fuji_kwargs = dict(extra_block_kwargs or {})
+        # Inject input_ids into extra_block_kwargs for SusonoBlock
+        susono_kwargs = dict(extra_block_kwargs or {})
         if getattr(self.config, 'use_engram', False):
-            fuji_kwargs['input_ids'] = input_ids
+            susono_kwargs['input_ids'] = input_ids
 
         return super().forward(
             input_ids=input_ids,
@@ -204,7 +204,7 @@ class FujiModel(GPTModel):
             labels=labels,
             inference_context=inference_context,
             packed_seq_params=packed_seq_params,
-            extra_block_kwargs=fuji_kwargs,
+            extra_block_kwargs=susono_kwargs,
             runtime_gather_output=runtime_gather_output,
             inference_params=inference_params,
             loss_mask=loss_mask,
@@ -212,32 +212,32 @@ class FujiModel(GPTModel):
         )
 
 
-def build_fuji_model(
+def build_susono_model(
     config: TransformerConfig,
     transformer_layer_spec: ModuleSpec,
     vocab_size: int,
     max_sequence_length: int,
     engram_config: Optional[EngramConfig] = None,
     **kwargs,
-) -> FujiModel:
-    """Convenience factory to construct a FujiModel and immediately replace
-    the TransformerBlock decoder with a FujiBlock.
+) -> SusonoModel:
+    """Convenience factory to construct a SusonoModel and immediately replace
+    the TransformerBlock decoder with a SusonoBlock.
 
-    This is the recommended entry-point for creating FujiModel instances.
+    This is the recommended entry-point for creating SusonoModel instances.
 
     Args:
         config:                 TransformerConfig.
-        transformer_layer_spec: Layer spec (use get_fuji_layer_spec()).
+        transformer_layer_spec: Layer spec (use get_susono_layer_spec()).
         vocab_size:             Vocabulary size.
         max_sequence_length:    Maximum sequence length.
         engram_config:          Optional Engram configuration.
-        **kwargs:               Forwarded to FujiModel.__init__.
+        **kwargs:               Forwarded to SusonoModel.__init__.
 
     Returns:
-        A fully-initialised FujiModel with FujiBlock as its decoder.
+        A fully-initialised SusonoModel with SusonoBlock as its decoder.
     """
-    # FujiModel.__init__ automatically calls _replace_decoder().
-    model = FujiModel(
+    # SusonoModel.__init__ automatically calls _replace_decoder().
+    model = SusonoModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
         vocab_size=vocab_size,

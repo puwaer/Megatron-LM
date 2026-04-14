@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""FujiBlock: TransformerBlock extended for mHC + Engram (Fuji architecture).
+"""SusonoBlock: TransformerBlock extended for mHC + Engram (Susono architecture).
 
-FujiBlock extends TransformerBlock with three additions:
+SusonoBlock extends TransformerBlock with three additions:
 
 1. **mHC stream expansion/collapse** (when config.use_mhc=True)
    - Expansion: [S, B, D] → [n, S, B, D] at the start of forward
@@ -19,7 +19,7 @@ FujiBlock extends TransformerBlock with three additions:
 
 Input/output contract:
   - forward() accepts and returns [S, B, D] when mHC is enabled, same as TransformerBlock
-  - This keeps FujiBlock as a drop-in replacement for TransformerBlock in FujiModel
+  - This keeps SusonoBlock as a drop-in replacement for TransformerBlock in SusonoModel
 
 Pipeline parallel notes:
   - Per-stage mHC: streams are expanded at the start of each stage's forward and collapsed
@@ -37,8 +37,8 @@ from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.models.engram.engram_module import EngramConfig, EngramModule
-from megatron.core.models.fuji.mhc_transformer_layer import MHCTransformerLayer
-from megatron.core.models.fuji.fuji_hybrid_decoder_layer import FujiLinearAttentionDecoderLayer
+from megatron.core.models.susono.mhc_transformer_layer import MHCTransformerLayer
+from megatron.core.models.susono.susono_hybrid_decoder_layer import SusonoLinearAttentionDecoderLayer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_block import (
     LayerNormImpl,
@@ -51,8 +51,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
-class FujiBlock(TransformerBlock):
-    """TransformerBlock subclass for the Fuji architecture (mHC + Engram).
+class SusonoBlock(TransformerBlock):
+    """TransformerBlock subclass for the Susono architecture (mHC + Engram).
 
     The block's forward pass keeps the [S, B, D] interface identical to
     TransformerBlock; stream expansion/collapse is managed internally.
@@ -144,10 +144,10 @@ class FujiBlock(TransformerBlock):
                             use_moe = False
 
                     # Create linear attention spec
-                    # FujiLinearAttentionDecoderLayer(config, layer_number, mlp_only=bool)
+                    # SusonoLinearAttentionDecoderLayer(config, layer_number, mlp_only=bool)
                     mlp_only = not use_moe
                     layer_specs[i] = ModuleSpec(
-                        module=FujiLinearAttentionDecoderLayer,
+                        module=SusonoLinearAttentionDecoderLayer,
                         params={"mlp_only": mlp_only},
                     )
 
@@ -205,7 +205,7 @@ class FujiBlock(TransformerBlock):
         """Instantiate and attach EngramModule to each eligible layer."""
         target_layer_ids = set(engram_config.engram_layer_ids)
         for layer in self.layers:
-            if not isinstance(layer, (MHCTransformerLayer, FujiLinearAttentionDecoderLayer)):
+            if not isinstance(layer, (MHCTransformerLayer, SusonoLinearAttentionDecoderLayer)):
                 continue
             # layer.layer_number is 1-indexed; convert to 0-indexed global ID
             layer_idx = layer.layer_number - 1
@@ -287,7 +287,7 @@ class FujiBlock(TransformerBlock):
         # --- Inject input_ids for Engram ---
         if input_ids is not None:
             for layer in self.layers:
-                if isinstance(layer, (MHCTransformerLayer, FujiLinearAttentionDecoderLayer)):
+                if isinstance(layer, (MHCTransformerLayer, SusonoLinearAttentionDecoderLayer)):
                     layer._current_input_ids = input_ids
 
         try:
@@ -295,7 +295,7 @@ class FujiBlock(TransformerBlock):
         finally:
             # Clear even on exception
             for layer in self.layers:
-                if isinstance(layer, (MHCTransformerLayer, FujiLinearAttentionDecoderLayer)):
+                if isinstance(layer, (MHCTransformerLayer, SusonoLinearAttentionDecoderLayer)):
                     layer._current_input_ids = None
 
         # --- mHC: collapse [n, S, B, D] → [S, B, D] ---

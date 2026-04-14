@@ -1,26 +1,26 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Layer specifications for the Fuji architecture (mHC + Engram).
+"""Layer specifications for the Susono architecture (mHC + Engram).
 
 Provides builder functions that return ModuleSpec objects wrapping
 MHCTransformerLayer with the appropriate submodule configurations.
 
 The pattern mirrors the existing GPT layer spec builders in
 ``megatron.core.models.gpt.gpt_layer_specs``, but uses MHCTransformerLayer
-as the outer module so that FujiBlock/TransformerBlock will instantiate
+as the outer module so that SusonoBlock/TransformerBlock will instantiate
 the mHC-capable layer class.
 
 Usage::
 
-    from megatron.core.models.fuji.fuji_layer_specs import (
-        get_fuji_layer_local_spec,
-        get_fuji_layer_with_transformer_engine_spec,
+    from megatron.core.models.susono.susono_layer_specs import (
+        get_susono_layer_local_spec,
+        get_susono_layer_with_transformer_engine_spec,
     )
 
     # Local (Megatron-Core native, no Transformer Engine required)
-    spec = get_fuji_layer_local_spec()
+    spec = get_susono_layer_local_spec()
 
     # Transformer Engine (recommended for FP8 training)
-    spec = get_fuji_layer_with_transformer_engine_spec()
+    spec = get_susono_layer_with_transformer_engine_spec()
 """
 
 import warnings
@@ -28,7 +28,7 @@ from typing import Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
-from megatron.core.models.fuji.mhc_transformer_layer import MHCTransformerLayer
+from megatron.core.models.susono.mhc_transformer_layer import MHCTransformerLayer
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -103,7 +103,7 @@ def _build_local_submodules(
 # Public spec builders
 # ---------------------------------------------------------------------------
 
-def get_fuji_layer_local_spec(
+def get_susono_layer_local_spec(
     normalization: str = "LayerNorm",
     qk_layernorm: bool = False,
 ) -> ModuleSpec:
@@ -128,7 +128,7 @@ def get_fuji_layer_local_spec(
     return ModuleSpec(module=MHCTransformerLayer, submodules=submodules)
 
 
-def get_fuji_layer_with_transformer_engine_spec(
+def get_susono_layer_with_transformer_engine_spec(
     normalization: str = "LayerNorm",
     qk_layernorm: bool = False,
     fp8: Optional[str] = None,
@@ -146,12 +146,12 @@ def get_fuji_layer_with_transformer_engine_spec(
         ``ModuleSpec(module=MHCTransformerLayer, submodules=...)``
     """
     assert HAVE_TE, (
-        "get_fuji_layer_with_transformer_engine_spec requires TransformerEngine. "
-        "Install it or use get_fuji_layer_local_spec() instead."
+        "get_susono_layer_with_transformer_engine_spec requires TransformerEngine. "
+        "Install it or use get_susono_layer_local_spec() instead."
     )
     if fp8 is not None:
         warnings.warn(
-            "The fp8 argument in get_fuji_layer_with_transformer_engine_spec is deprecated."
+            "The fp8 argument in get_susono_layer_with_transformer_engine_spec is deprecated."
         )
     backend = TESpecProvider()
     rms_norm = normalization == "RMSNorm"
