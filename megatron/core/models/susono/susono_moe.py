@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Qwen3-Next-style Sparse Mixture-of-Experts for the Fuji architecture.
+"""Qwen3-Next-style Sparse Mixture-of-Experts for the Susono architecture.
 
 Design (from Qwen3-Next):
   - Top-k routing with softmax probabilities and optional probability normalisation.
@@ -9,7 +9,7 @@ Design (from Qwen3-Next):
   - Both expert types use a SwiGLU MLP.
 
 Expert Parallelism (EP):
-  - FujiRoutedExperts shards experts across EP ranks.
+  - SusonoRoutedExperts shards experts across EP ranks.
   - Each GPU holds num_experts / EP local experts.
   - EP > 1: tokens are dispatched via all-to-all before expert compute and
     gathered back via all-to-all after. Routing weights are applied inside
@@ -95,7 +95,7 @@ class _SwiGLUMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class FujiTopKRouter(nn.Module):
+class SusonoTopKRouter(nn.Module):
     """Softmax-based top-k token router with Switch-style load-balancing loss.
 
     Computes per-token routing probabilities, selects top-k experts, and
@@ -131,7 +131,7 @@ class FujiTopKRouter(nn.Module):
         self.norm_topk_prob = norm_topk_prob
         self.moe_aux_loss_coeff = moe_aux_loss_coeff
         self.num_layers = num_layers
-        self.layer_number: Optional[int] = None  # Set by FujiSparseMoE after construction
+        self.layer_number: Optional[int] = None  # Set by SusonoSparseMoE after construction
         self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
         nn.init.kaiming_uniform_(self.weight, a=5 ** 0.5)
 
@@ -186,7 +186,7 @@ class FujiTopKRouter(nn.Module):
         return routing_probs, top_weights.to(hidden_states.dtype), top_indices
 
 
-class FujiRoutedExperts(nn.Module):
+class SusonoRoutedExperts(nn.Module):
     """EP-aware batched routed experts.
 
     Each GPU holds ``num_local_experts = num_experts / EP`` experts.
@@ -405,7 +405,7 @@ class FujiRoutedExperts(nn.Module):
     ) -> Tensor:
         """GroupedGEMM path for local expert computation.
 
-        Weight convention (kept from original FujiRoutedExperts):
+        Weight convention (kept from original SusonoRoutedExperts):
           gate_up_proj: [E_local, 2*I, D]  → gmm with trans_b=True → [N, D] @ [D, 2I]
           down_proj:    [E_local, D, I]    → gmm with trans_b=True → [N, I] @ [I, D]
         """
@@ -636,7 +636,7 @@ class FujiRoutedExperts(nn.Module):
 # Full MoE block
 # ──────────────────────────────────────────────────────────────────────────────
 
-class FujiSparseMoE(nn.Module):
+class SusonoSparseMoE(nn.Module):
     """Qwen3-Next-style Sparse Mixture-of-Experts block.
 
     Structure:
@@ -668,7 +668,7 @@ class FujiSparseMoE(nn.Module):
         aux_loss_coeff  = getattr(config, 'moe_aux_loss_coeff', 0.0)
         num_layers      = getattr(config, 'num_layers', 1)
 
-        self.gate = FujiTopKRouter(
+        self.gate = SusonoTopKRouter(
             num_experts=num_experts,
             num_experts_per_tok=num_experts_tok,
             hidden_size=hidden,
@@ -677,7 +677,7 @@ class FujiSparseMoE(nn.Module):
             num_layers=num_layers,
         )
         self.gate.layer_number = layer_number
-        self.experts = FujiRoutedExperts(
+        self.experts = SusonoRoutedExperts(
             num_experts=num_experts,
             hidden_size=hidden,
             intermediate_size=moe_inter,
@@ -689,7 +689,7 @@ class FujiSparseMoE(nn.Module):
         """Sharded state dict for dist_checkpointing.
 
         Delegates to each child's sharded_state_dict (or fallback) so that
-        FujiRoutedExperts.sharded_state_dict is correctly invoked for EP sharding.
+        SusonoRoutedExperts.sharded_state_dict is correctly invoked for EP sharding.
         Without this override, the default traversal calls state_dict() on this
         entire module and wraps expert weights as non-sharded tensors, causing a
         global shape mismatch when the checkpoint has EP=1 shapes.
@@ -714,7 +714,7 @@ class FujiSparseMoE(nn.Module):
             output:        [S, B, D]
             router_logits: [T, num_experts]  — routing probability vector.
                            Auxiliary load-balancing loss is computed and registered
-                           inside FujiTopKRouter via save_to_aux_losses_tracker().
+                           inside SusonoTopKRouter via save_to_aux_losses_tracker().
         """
         S, B, D = hidden_states.shape
         x = hidden_states.reshape(-1, D)                   # [T, D]
@@ -736,7 +736,7 @@ class FujiSparseMoE(nn.Module):
 # Dense MLP fallback (for mlp_only_layers)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class FujiDenseMLP(nn.Module):
+class SusonoDenseMLP(nn.Module):
     """Dense SwiGLU MLP used for layers in mlp_only_layers.
 
     Args:

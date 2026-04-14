@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""GatedDeltaNet linear attention for the Fuji / Qwen3-Next architecture.
+"""GatedDeltaNet linear attention for the Susono / Qwen3-Next architecture.
 
 Megatron-LM uses sequence-first tensors [S, B, D].  This module transposes to
 batch-first [B, S, D] internally for the core computation, then converts back.
@@ -234,7 +234,7 @@ class _RMSNormGated(nn.Module):
 # GatedDeltaNet module
 # ──────────────────────────────────────────────────────────────────────────────
 
-class FujiGatedDeltaNet(nn.Module):
+class SusonoGatedDeltaNet(nn.Module):
     """GatedDeltaNet linear attention layer (Megatron [S, B, D] convention).
 
     Internally converts to batch-first [B, S, D] for computation then back.

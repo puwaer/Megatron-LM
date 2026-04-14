@@ -1,9 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Hybrid decoder layer for the Fuji / Qwen3-Next architecture.
+"""Hybrid decoder layer for the Susono / Qwen3-Next architecture.
 
-Provides FujiLinearAttentionDecoderLayer — a complete decoder layer that uses
+Provides SusonoLinearAttentionDecoderLayer — a complete decoder layer that uses
 GatedDeltaNet linear attention instead of softmax self-attention.  It mirrors
-the interface of MHCTransformerLayer so that FujiBlock can store both types
+the interface of MHCTransformerLayer so that SusonoBlock can store both types
 in a single nn.ModuleList and call them uniformly.
 
 Layer structure (Qwen3-Next linear attention layer):
@@ -24,11 +24,11 @@ from torch import Tensor
 
 from megatron.core.models.engram.engram_module import EngramModule
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.models.fuji.fuji_gated_delta_net import (
-    FujiGatedDeltaNet,
+from megatron.core.models.susono.susono_gated_delta_net import (
+    SusonoGatedDeltaNet,
     GatedDeltaNetInferenceCache,
 )
-from megatron.core.models.fuji.fuji_moe import FujiDenseMLP, FujiSparseMoE
+from megatron.core.models.susono.susono_moe import SusonoDenseMLP, SusonoSparseMoE
 from megatron.core.transformer.mhc import ManifoldConstrainedHyperConnection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
@@ -39,7 +39,7 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _RMSNorm(nn.Module):
-    """RMSNorm with (1 + w) scaling, matching Qwen3-Next's FujiRMSNorm."""
+    """RMSNorm with (1 + w) scaling, matching Qwen3-Next's SusonoRMSNorm."""
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -56,10 +56,10 @@ class _RMSNorm(nn.Module):
 # Hybrid linear attention decoder layer
 # ──────────────────────────────────────────────────────────────────────────────
 
-class FujiLinearAttentionDecoderLayer(MegatronModule):
+class SusonoLinearAttentionDecoderLayer(MegatronModule):
     """Complete decoder layer using GatedDeltaNet linear attention.
 
-    Drop-in companion to MHCTransformerLayer inside FujiBlock.  The public
+    Drop-in companion to MHCTransformerLayer inside SusonoBlock.  The public
     interface is identical:
 
         output, context = layer(hidden_states, **kwargs)
@@ -95,13 +95,13 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
         self.post_attention_layernorm = _RMSNorm(D, eps=eps)
 
         # Linear attention
-        self.linear_attn = FujiGatedDeltaNet(config, layer_idx=self.layer_idx)
+        self.linear_attn = SusonoGatedDeltaNet(config, layer_idx=self.layer_idx)
 
         # Feed-forward (MoE or dense)
         if mlp_only:
-            self.mlp = FujiDenseMLP(config)
+            self.mlp = SusonoDenseMLP(config)
         else:
-            self.mlp = FujiSparseMoE(config, layer_number=self.layer_number)
+            self.mlp = SusonoSparseMoE(config, layer_number=self.layer_number)
 
         # mHC connection (created if enabled in config)
         self.mhc: Optional[ManifoldConstrainedHyperConnection] = None
@@ -114,10 +114,10 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
                 use_fused_kernel=getattr(config, 'mhc_use_fused_kernel', False),
             )
 
-        # Engram module — attached externally by FujiBlock
+        # Engram module — attached externally by SusonoBlock
         self.engram: Optional[EngramModule] = None
 
-        # Placeholder for input_ids injected by FujiBlock before forward
+        # Placeholder for input_ids injected by SusonoBlock before forward
         self._current_input_ids: Optional[Tensor] = None
 
     # ------------------------------------------------------------------
@@ -175,7 +175,7 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
         When mHC is enabled, hidden_states is [n, S, B, D] and mHC aggregate /
         distribute is handled here (mirroring MHCTransformerLayer).
 
-        input_ids for Engram is read from self._current_input_ids (set by FujiBlock).
+        input_ids for Engram is read from self._current_input_ids (set by SusonoBlock).
 
         Args:
             hidden_states:   [n, S, B, D] with mHC, [S, B, D] without.
@@ -209,5 +209,5 @@ class FujiLinearAttentionDecoderLayer(MegatronModule):
             hidden_states, _router_logits = self._layer_forward(hidden_states, attention_mask, inference_cache, **kwargs)
 
         # Return None as context (matching TransformerLayer interface).
-        # MoE auxiliary loss is handled via save_to_aux_losses_tracker() inside FujiTopKRouter.
+        # MoE auxiliary loss is handled via save_to_aux_losses_tracker() inside SusonoTopKRouter.
         return hidden_states, None

@@ -1,6 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Pretrain Fuji."""
+"""Pretrain Susono."""
 
 import os
 import torch
@@ -9,10 +9,10 @@ from typing import Union
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
-from megatron.core.models.fuji.fuji_model import FujiModel
-from megatron.core.models.fuji.fuji_layer_specs import (
-    get_fuji_layer_with_transformer_engine_spec,
-    get_fuji_layer_local_spec,
+from megatron.core.models.susono.susono_model import SusonoModel
+from megatron.core.models.susono.susono_layer_specs import (
+    get_susono_layer_with_transformer_engine_spec,
+    get_susono_layer_local_spec,
 )
 from megatron.core.models.engram.engram_module import EngramConfig
 from megatron.training import (
@@ -29,21 +29,21 @@ from megatron.core.utils import StragglerDetector
 
 stimer = StragglerDetector()
 
-def fuji_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
-    """Build the Fuji model."""
-    print_rank_0('building Fuji model ...')
+def susono_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
+    """Build the Susono model."""
+    print_rank_0('building Susono model ...')
 
     if config is None:
         config = core_transformer_config_from_args(args)
 
     # 1. Select the appropriate layer spec
     if args.transformer_impl == 'transformer_engine':
-        transformer_layer_spec = get_fuji_layer_with_transformer_engine_spec(
+        transformer_layer_spec = get_susono_layer_with_transformer_engine_spec(
             normalization=args.normalization,
             qk_layernorm=args.qk_layernorm,
         )
     else:
-        transformer_layer_spec = get_fuji_layer_local_spec(
+        transformer_layer_spec = get_susono_layer_local_spec(
             normalization=args.normalization,
             qk_layernorm=args.qk_layernorm,
         )
@@ -64,8 +64,8 @@ def fuji_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
             base_vocab_size=getattr(config, 'engram_base_vocab_size', args.padded_vocab_size),
         )
 
-    # 3. Instantiate FujiModel
-    model = FujiModel(
+    # 3. Instantiate SusonoModel
+    model = SusonoModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
         vocab_size=args.padded_vocab_size,
@@ -85,7 +85,7 @@ def fuji_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
 def model_provider(pre_process=True, post_process=True, config=None, pg_collection=None):
     """Wrapper for the model builder."""
     args = get_args()
-    return fuji_builder(
+    return susono_builder(
         args,
         pre_process=pre_process,
         post_process=post_process,
@@ -120,9 +120,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     )
 
     print_rank_0("> building train, validation, and test datasets "
-                 "for Fuji ...")
+                 "for Susono ...")
 
-    # We use GPTDataset/GPTDatasetConfig as Fuji is GPT-compatible for data
+    # We use GPTDataset/GPTDatasetConfig as Susono is GPT-compatible for data
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         GPTDataset,
         train_val_test_num_samples,
@@ -130,7 +130,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         gpt_config
     ).build()
 
-    print_rank_0("> finished creating Fuji datasets ...")
+    print_rank_0("> finished creating Susono datasets ...")
     return train_ds, valid_ds, test_ds
 
 def forward_step(data_iterator, model):
@@ -174,8 +174,8 @@ def loss_func(loss_mask, output_tensor):
 
     return loss, {'lm loss': averaged_loss[0]}
 
-def add_fuji_args(parser):
-    # All Fuji-specific arguments (use_mhc, mhc_*, use_engram, engram_*) are already
+def add_susono_args(parser):
+    # All Susono-specific arguments (use_mhc, mhc_*, use_engram, engram_*) are already
     # registered automatically via ArgumentGroupFactory(TransformerConfig) in
     # megatron/training/arguments.py. Re-registering them here would cause a conflict.
     return parser
@@ -187,5 +187,5 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_fuji_args
+        extra_args_provider=add_susono_args
     )

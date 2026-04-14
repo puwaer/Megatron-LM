@@ -4,7 +4,7 @@
 This module extends the standard TransformerLayer so that it operates on a stack
 of n parallel residual streams (mHC) rather than a single hidden-state tensor.
 
-Hidden-state convention inside FujiBlock:
+Hidden-state convention inside SusonoBlock:
     Standard Megatron: [S, B, D]
     mHC multi-stream:  [n, S, B, D]
 
@@ -133,7 +133,7 @@ class MHCTransformerLayer(TransformerLayer):
         """Forward pass with mHC multi-stream management and optional Engram memory.
 
         input_ids (if needed by Engram) is read from the ``_current_input_ids``
-        attribute that FujiBlock sets before calling this layer's forward.
+        attribute that SusonoBlock sets before calling this layer's forward.
 
         Args:
             hidden_states: Shape [n, S, B, D] when use_mhc=True, else [S, B, D].
@@ -144,7 +144,7 @@ class MHCTransformerLayer(TransformerLayer):
             Tuple (hidden_states, context) where hidden_states has the same leading
             shape as the input ([n,S,B,D] or [S,B,D]).
         """
-        # Retrieve input_ids injected by FujiBlock (None if not set)
+        # Retrieve input_ids injected by SusonoBlock (None if not set)
         input_ids: Optional[Tensor] = getattr(self, '_current_input_ids', None)
 
         if self.mhc is not None:
