@@ -1035,6 +1035,17 @@ def validate_args(args, defaults={}):
         assert not args.use_legacy_models, \
             '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
 
+    # Convert --no-weight-decay-cond-type to the canonical apply_wd_to_qk_layernorm flag
+    # so that dataclasses.fields() auto-mapping in get_megatron_optimizer_config() picks it up.
+    if getattr(args, 'no_weight_decay_cond_type', None) is not None:
+        if args.no_weight_decay_cond_type == 'apply_wd_to_qk_layernorm':
+            args.apply_wd_to_qk_layernorm = True
+        else:
+            raise ValueError(
+                f'Invalid --no-weight-decay-cond-type value: {args.no_weight_decay_cond_type}'
+            )
+        args.no_weight_decay_cond_type = None
+
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'

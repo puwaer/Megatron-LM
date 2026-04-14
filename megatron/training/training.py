@@ -76,7 +76,7 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
+from megatron.core.optimizer import get_megatron_optimizer, get_standard_config_overrides, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
@@ -1188,17 +1188,10 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     else:
         raise ValueError("Invalid optimizer type!")
 
-    # Construct the appropriate config_overrides object.
-    # TODO: add more logic here as needed down the road.
-    if args.decoupled_lr is not None:
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        decoupled_optimizer_config = copy.deepcopy(config)
-        decoupled_optimizer_config.lr = args.decoupled_lr
-        if args.decoupled_min_lr is not None:
-            decoupled_optimizer_config.min_lr = args.decoupled_min_lr
-        config_overrides = {decoupled_param_key: decoupled_optimizer_config}
-    else:
-        config_overrides = None
+    # Build standard config_overrides (handles decoupled_lr for embedding/output layers).
+    # Weight-decay skipping is handled inside _get_param_groups() via
+    # config.apply_wd_to_qk_layernorm and does not require a config_overrides entry.
+    config_overrides = get_standard_config_overrides(config)
 
     return config, config_overrides
 

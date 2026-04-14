@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
+import fnmatch
 import logging
 import warnings
 from dataclasses import astuple
@@ -50,13 +51,23 @@ from .optimizer import (
     MegatronOptimizer,
     param_group_identifier_keys,
 )
-from .optimizer_config import AdamOptimizerConfig, OptimizerConfig, ParamKey, SGDOptimizerConfig
+from .optimizer_config import (
+    AdamOptimizerConfig,
+    OptimizerConfig,
+    ParamKey,
+    ParamPredicate,
+    ParamWithNamePredicate,
+    SGDOptimizerConfig,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def _matches(param: torch.nn.Parameter, param_name: str, param_key: ParamKey) -> bool:
     """Returns true if passed-in parameter (with name) matches `param_key`.
+
+    Delegates to ``ParamKey.matches()`` which supports glob patterns (fnmatch),
+    attribute checks, and callable predicates (ParamPredicate / ParamWithNamePredicate).
 
     Args:
         param (torch.nn.Parameter): Handle to parameter object.
@@ -66,26 +77,39 @@ def _matches(param: torch.nn.Parameter, param_name: str, param_key: ParamKey) ->
     Returns:
         bool: True if parameter matches passed-in param_key.
     """
+    return param_key.matches(param, param_name)
 
-    # Check if name matches.
-    if isinstance(param_key.name, str):
-        target_names = [param_key.name]
-    else:
-        target_names = list(param_key.name)
-    for target_name in target_names:
-        if param_name in target_name:
-            return True
 
-    # Check if attribute matches.
-    if isinstance(param_key.attr, str):
-        target_attrs = [param_key.attr]
-    else:
-        target_attrs = list(param_key.attr)
-    for target_attr in target_attrs:
-        if getattr(param, target_attr, False):
-            return True
+def get_standard_config_overrides(
+    config: OptimizerConfig,
+) -> Optional[Dict[ParamKey, OptimizerConfig]]:
+    """Return standard config overrides for decoupled learning rate.
 
-    return False
+    When ``config.decoupled_lr`` is set, embedding / output-layer parameters
+    (those with ``is_embedding_or_output_parameter=True``) receive a separate
+    learning rate schedule.
+
+    Weight-decay skipping (bias / 1-D params, with optional qk_layernorm
+    exception) is handled directly inside ``_get_param_groups()`` via the
+    ``config.apply_wd_to_qk_layernorm`` flag and does NOT require a separate
+    config_overrides entry.
+
+    Args:
+        config (OptimizerConfig): optimizer configuration object.
+
+    Returns:
+        Dict mapping ParamKey → OptimizerConfig override, or None.
+    """
+    if config.decoupled_lr is None:
+        return None
+
+    decoupled_optimizer_config = copy.deepcopy(config)
+    decoupled_optimizer_config.lr = config.decoupled_lr
+    if config.decoupled_min_lr is not None:
+        decoupled_optimizer_config.min_lr = config.decoupled_min_lr
+
+    decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
+    return {decoupled_param_key: decoupled_optimizer_config}
 
 
 def _get_param_groups(
@@ -134,10 +158,16 @@ def _get_param_groups(
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
-            # TODO: Make sure there is a way to support old no_weight_decay_func functionality
-            # and default_skip_embedding_weight_decay:
-            #     or (default_skip_embedding_weight_decay and "embedding" in name)
-            no_wd = name.endswith(".bias") or len(param.shape) == 1
+            # Determine whether this parameter should skip weight decay.
+            # Default: skip WD for all 1-D params and biases (classic Megatron behaviour).
+            # When apply_wd_to_qk_layernorm=True: q_layernorm / k_layernorm 1-D params and
+            # biases *do* receive weight decay, matching the Qwen/fuji model convention.
+            if config.apply_wd_to_qk_layernorm:
+                no_wd = (name.endswith(".bias") or len(param.shape) == 1) and not (
+                    "q_layernorm." in name or "k_layernorm." in name
+                )
+            else:
+                no_wd = name.endswith(".bias") or len(param.shape) == 1
             if not no_wd:
                 wd_mult = 1.0
             else:
