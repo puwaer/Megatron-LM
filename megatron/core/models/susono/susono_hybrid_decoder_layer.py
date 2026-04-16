@@ -9,10 +9,10 @@ in a single nn.ModuleList and call them uniformly.
 Layer structure (Qwen3-Next linear attention layer):
     RMSNorm  →  GatedDeltaNet  →  residual
     RMSNorm  →  MoE / MLP      →  residual
-    (mHC aggregate / distribute wraps the above when use_mhc=True)
+    (MHC-Lite aggregate / distribute wraps the above when use_mhc=True)
     (Engram memory added to x_in before GatedDeltaNet when attached)
 
-Megatron tensor convention: [S, B, D] without mHC, [n, S, B, D] with mHC.
+Megatron tensor convention: [S, B, D] without MHC-Lite, [n, S, B, D] with MHC-Lite.
 """
 
 from typing import Optional, Tuple
@@ -64,7 +64,7 @@ class SusonoLinearAttentionDecoderLayer(MegatronModule):
 
         output, context = layer(hidden_states, **kwargs)
 
-    where hidden_states is [n,S,B,D] with mHC or [S,B,D] without.
+    where hidden_states is [n,S,B,D] with MHC-Lite or [S,B,D] without.
 
     Args:
         config:       TransformerConfig.
@@ -103,7 +103,7 @@ class SusonoLinearAttentionDecoderLayer(MegatronModule):
         else:
             self.mlp = SusonoSparseMoE(config, layer_number=self.layer_number)
 
-        # mHC connection (created if enabled in config)
+        # MHC-Lite connection (created if enabled in config)
         self.mhc: Optional[ManifoldConstrainedHyperConnection] = None
         if getattr(config, 'use_mhc', False):
             self.mhc = ManifoldConstrainedHyperConnection(
@@ -161,7 +161,7 @@ class SusonoLinearAttentionDecoderLayer(MegatronModule):
         return x, router_logits
 
     # ------------------------------------------------------------------
-    # Public forward (handles mHC and Engram)
+    # Public forward (handles MHC-Lite and Engram)
     # ------------------------------------------------------------------
 
     def forward(
@@ -173,13 +173,13 @@ class SusonoLinearAttentionDecoderLayer(MegatronModule):
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Forward pass.
 
-        When mHC is enabled, hidden_states is [n, S, B, D] and mHC aggregate /
+        When MHC-Lite is enabled, hidden_states is [n, S, B, D] and MHC-Lite aggregate /
         distribute is handled here (mirroring MHCTransformerLayer).
 
         input_ids for Engram is read from self._current_input_ids (set by SusonoBlock).
 
         Args:
-            hidden_states:   [n, S, B, D] with mHC, [S, B, D] without.
+            hidden_states:   [n, S, B, D] with MHC-Lite, [S, B, D] without.
             attention_mask:  Padding mask for GatedDeltaNet.
             inference_cache: Per-layer GatedDeltaNet cache.
             **kwargs:        Ignored (for interface compatibility with TransformerLayer).
@@ -191,7 +191,7 @@ class SusonoLinearAttentionDecoderLayer(MegatronModule):
         input_ids: Optional[Tensor] = getattr(self, '_current_input_ids', None)
 
         if self.mhc is not None:
-            # ── mHC path: [n,S,B,D] ─────────────────────────────────
+            # ── MHC-Lite path: [n,S,B,D] ────────────────────────────
             x_in = self.mhc.aggregate_streams(hidden_states)   # [S, B, D]
 
             # Engram memory injection

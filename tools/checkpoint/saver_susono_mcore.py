@@ -74,7 +74,7 @@ def _save_checkpoint_impl(queue, args):
 
     # stream_proj はメタデータに埋め込まれている
     if getattr(md, 'stream_proj_weight', None) is not None:
-        state_dict['decoder.stream_proj.weight'] = md.stream_proj_weight
+        state_dict['decoder.stream_proj_pp0.weight'] = md.stream_proj_weight
 
     def _check(msg, expected_name):
         if getattr(args, 'checking', True) and isinstance(msg, dict):
@@ -93,7 +93,7 @@ def _save_checkpoint_impl(queue, args):
         _check(msg, f'transformer layer {i}')
         pfx = f'decoder.layers.{i}'
 
-        # mHC パラメータ
+        # MHC-Lite パラメータ
         for p in ['norm.weight', 'static_alpha', 'dynamic_alpha_fn', 'pre_branch_scale',
                   'residual_scale', 'static_beta', 'dynamic_beta_fn', 'h_post_scale']:
             key = f'mhc.{p}'

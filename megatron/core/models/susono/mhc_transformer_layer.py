@@ -1,12 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""MHCTransformerLayer: TransformerLayer wrapped with mHC multi-stream residuals.
+"""MHCTransformerLayer: TransformerLayer wrapped with MHC-Lite multi-stream residuals.
 
 This module extends the standard TransformerLayer so that it operates on a stack
-of n parallel residual streams (mHC) rather than a single hidden-state tensor.
+of n parallel residual streams (MHC-Lite) rather than a single hidden-state tensor.
+MHC-Lite uses a convex combination of permutation matrices (no Sinkhorn iteration).
 
 Hidden-state convention inside SusonoBlock:
     Standard Megatron: [S, B, D]
-    mHC multi-stream:  [n, S, B, D]
+    MHC-Lite multi-stream:  [n, S, B, D]
 
 At the layer boundary (MHC-Lite):
   1. width_connection: [n,S,B,D] → [S,B,D]       (input-gated aggregation + permutation mix)
@@ -34,7 +35,7 @@ from megatron.core.transformer.transformer_layer import (
 
 
 class MHCTransformerLayer(TransformerLayer):
-    """TransformerLayer extended with Manifold-Constrained Hyper-Connection (mHC) residuals
+    """TransformerLayer extended with MHC-Lite (Manifold-Constrained Hyper-Connection Lite) residuals
     and optional Engram conditional memory.
 
     When config.use_mhc is True the module expects hidden_states of shape [n, S, B, D]
@@ -73,7 +74,7 @@ class MHCTransformerLayer(TransformerLayer):
             is_mtp_layer=is_mtp_layer,
         )
 
-        # mHC module — created only when the feature is enabled
+        # MHC-Lite module — created only when the feature is enabled
         self.mhc: Optional[ManifoldConstrainedHyperConnection] = None
         if getattr(config, 'use_mhc', False):
             self.mhc = ManifoldConstrainedHyperConnection(
@@ -114,7 +115,7 @@ class MHCTransformerLayer(TransformerLayer):
             and torch.cuda.is_available()
         ):
             # priority=-1 → high priority; typical NCCL/compute streams use 0.
-            # High priority allows the CUDA scheduler to issue mHC SM kernels
+            # High priority allows the CUDA scheduler to issue MHC-Lite SM kernels
             # as soon as the dependency event is satisfied, even while lower-
             # priority streams have pending work.
             self._mhc_stream = torch.cuda.Stream(priority=-1)
@@ -131,7 +132,7 @@ class MHCTransformerLayer(TransformerLayer):
         hidden_states: Tensor,
         **kwargs,
     ):
-        """Forward pass with mHC multi-stream management and optional Engram memory.
+        """Forward pass with MHC-Lite multi-stream management and optional Engram memory.
 
         input_ids (if needed by Engram) is read from the ``_current_input_ids``
         attribute that SusonoBlock sets before calling this layer's forward.
@@ -243,7 +244,7 @@ class MHCTransformerLayer(TransformerLayer):
                 # 4. Depth connection: distribute layer output back to n streams
                 hidden_states = add_residual(x_out)             # [n, S, B, D]
         else:
-            # --- Standard path (mHC disabled) ---
+            # --- Standard path (MHC-Lite disabled) ---
             if self.engram is not None and input_ids is not None:
                 hidden_states = hidden_states + self.engram(input_ids, hidden_states)
 

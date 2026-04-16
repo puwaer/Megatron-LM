@@ -91,7 +91,7 @@ def _save_checkpoint_impl(queue, args):
         dst     = f'model.layers.{i}'
         is_full = i in full_attn_layers
 
-        # mHC パラメータ
+        # MHC-Lite パラメータ
         for p in ['norm.weight', 'static_alpha', 'dynamic_alpha_fn', 'pre_branch_scale',
                   'residual_scale', 'static_beta', 'dynamic_beta_fn', 'h_post_scale']:
             key = f'mhc.{p}'
@@ -100,9 +100,10 @@ def _save_checkpoint_impl(queue, args):
 
         if is_full:
             # --- Full Attention 層 ---
-            # Megatron: x*w → HF: x*(1+w) → -1.0 オフセット
-            hf[f'{dst}.input_layernorm.weight']          = msg['input norm weight'] - 1.0
-            hf[f'{dst}.post_attention_layernorm.weight'] = msg['post norm weight']  - 1.0
+            # Megatron: layernorm_zero_centered_gamma=True のため重みは 0 初期化済み (1+w 形式)
+            # HF SusonoRMSNorm も同一の 0 初期化 (1+w 形式) → オフセット不要
+            hf[f'{dst}.input_layernorm.weight']          = msg['input norm weight']
+            hf[f'{dst}.post_attention_layernorm.weight'] = msg['post norm weight']
 
             # QKV 分割 (GQA インターリーブを解除)
             qkv_w   = msg['qkv weight']
@@ -154,8 +155,9 @@ def _save_checkpoint_impl(queue, args):
     # ── 最終層ノルム ──────────────────────────────────────────────────────
     msg = queue.get()
     _check(msg, 'final layer norm')
-    # Megatron: x*w → HF: x*(1+w) → -1.0 オフセット
-    hf['model.norm.weight'] = msg['weight'] - 1.0
+    # Megatron: layernorm_zero_centered_gamma=True のため重みは 0 初期化済み (1+w 形式)
+    # HF SusonoRMSNorm も同一の 0 初期化 (1+w 形式) → オフセット不要
+    hf['model.norm.weight'] = msg['weight']
 
     # ── 出力層 ────────────────────────────────────────────────────────────
     msg = queue.get()
