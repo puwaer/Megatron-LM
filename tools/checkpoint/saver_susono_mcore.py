@@ -20,6 +20,7 @@ Megatron の tools/checkpoint/convert.py フレームワーク用。
       [--susono-tp 1] [--susono-pp 1] [--susono-ep 1] [--susono-iteration 0]
 """
 
+import io
 import json
 import os
 import types
@@ -137,6 +138,23 @@ def _save_checkpoint_impl(queue, args):
 
     if msg != 'done':
         raise RuntimeError(f'キュープロトコルエラー: "done" を期待しましたが {msg!r} を受信しました。')
+
+    # ── Transformer Engine _extra_state (TE FP8 初期化状態) ──────────────────
+    # distcp は ShardedObject.unique_key = {key}/shard_{offset}_{shape} 形式で管理する。
+    # TE 未初期化状態は get_extra_state() == None → [None] を bytes にシリアライズして保存。
+    # global_offset=(0,), global_shape=(1,) → suffix は /shard_0_1 (PP=1 単一シャード)。
+    buf = io.BytesIO()
+    torch.save([None], buf)
+    _te_es = buf.getvalue()
+
+    for i in full_attn_layers:
+        pfx = f'decoder.layers.{i}'
+        for sub in ['input_layernorm', 'self_attention.linear_qkv',
+                    'self_attention.linear_proj', 'pre_mlp_layernorm',
+                    'mlp.linear_fc1', 'mlp.linear_fc2']:
+            state_dict[f'{pfx}.{sub}._extra_state/shard_0_1'] = io.BytesIO(_te_es)
+
+    state_dict['decoder.final_layernorm._extra_state/shard_0_1'] = io.BytesIO(_te_es)
 
     print(f'[saver_susono_mcore] state_dict キー数: {len(state_dict)}')
 

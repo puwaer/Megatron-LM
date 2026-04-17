@@ -385,8 +385,15 @@ def _replace_sharded_keys_with_state_dict_keys(
     """Inverse of _replace_state_dict_keys_with_sharded_keys."""
     recovered_sd = {}
     for k, tensors in state_dict.items():
+        if not isinstance(tensors, list):
+            tensors = [tensors]  # ShardedObject loads as BytesIO, not wrapped in list
         assert len(tensors) == len(rename_mapping[k])
         for ten, recovered_k in zip(tensors, rename_mapping[k]):
+            if isinstance(ten, io.BytesIO):
+                ten.seek(0)
+                loaded = torch.load(ten, map_location='cpu', weights_only=False)
+                data = loaded[0] if (isinstance(loaded, list) and len(loaded) == 1) else loaded
+                ten = torch.empty(0, dtype=torch.uint8) if data is None else data
             recovered_sd[recovered_k] = ten
 
     return unflatten_state_dict(recovered_sd, flat_mapping)
