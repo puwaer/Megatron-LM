@@ -38,6 +38,9 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
 # Norm
 # ──────────────────────────────────────────────────────────────────────────────
 
+from megatron.core.fusions.susono_fused_norm import rmsnorm_1p
+
+
 class _RMSNorm(nn.Module):
     """RMSNorm with (1 + w) scaling, matching Qwen3-Next's SusonoRMSNorm."""
 
@@ -47,9 +50,7 @@ class _RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))  # (1+w) init → zero
 
     def forward(self, x: Tensor) -> Tensor:
-        x_f = x.float()
-        out = x_f * torch.rsqrt((x_f * x_f).mean(-1, keepdim=True) + self.eps)
-        return (out * (1.0 + self.weight.float())).type_as(x)
+        return rmsnorm_1p(x, self.weight, self.eps)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

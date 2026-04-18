@@ -215,19 +215,19 @@ def _recurrent_gated_delta_rule(
 # RMSNorm with gating (output norm)
 # ──────────────────────────────────────────────────────────────────────────────
 
+from megatron.core.fusions.susono_fused_norm import rmsnorm_gated
+
+
 class _RMSNormGated(nn.Module):
+    """Output RMSNorm for GatedDeltaNet: standard RMSNorm * SiLU(gate)."""
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
     def forward(self, x: Tensor, gate: Tensor) -> Tensor:
-        dtype = x.dtype
-        x = x.float()
-        var = (x * x).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        x = self.weight * x.to(dtype)
-        return x * F.silu(gate.float()).to(dtype)
+        return rmsnorm_gated(x, self.weight, gate, self.eps)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

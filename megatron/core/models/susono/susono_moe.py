@@ -57,6 +57,37 @@ try:
 except ImportError:
     _HAVE_SHARDED_TENSOR = False
 
+# Liger-Kernel: fused SiLU*Mul (no intermediate cat).  Falls back to in-tree
+# Megatron JIT-fused swiglu when unavailable.
+try:
+    from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+    _HAVE_LIGER_SWIGLU = True
+except ImportError:
+    LigerSiLUMulFunction = None
+    _HAVE_LIGER_SWIGLU = False
+
+from megatron.core.fusions.fused_bias_swiglu import SwiGLUFunction, swiglu
+
+
+def _fused_silu_mul(gate: Tensor, up: Tensor) -> Tensor:
+    """Fused SiLU(gate) * up with backward.
+
+    Uses Liger Triton kernel when available (no tensor concatenation),
+    otherwise falls back to Megatron's JIT-fused swiglu via concatenation.
+    """
+    if _HAVE_LIGER_SWIGLU:
+        return LigerSiLUMulFunction.apply(gate, up)
+    # Megatron fallback: concat then use fused SwiGLU.
+    return SwiGLUFunction.apply(torch.cat([gate, up], dim=-1), False, False)
+
+
+def _fused_swiglu_concat(gate_up: Tensor) -> Tensor:
+    """Fused SwiGLU for pre-concatenated [..., 2I] input (chunks internally).
+
+    Used on GroupedGEMM output where gate/up are already concatenated.
+    """
+    return SwiGLUFunction.apply(gate_up, False, False)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -92,7 +123,9 @@ class _SwiGLUMLP(nn.Module):
         self.down_proj  = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        return self.down_proj(_fused_silu_mul(gate, up))
 
 
 class SusonoTopKRouter(nn.Module):
@@ -417,9 +450,8 @@ class SusonoRoutedExperts(nn.Module):
         # fc1: [N, D] @ gate_up_proj[e].T = [N, 2I]
         fc1 = gg.ops.gmm(tokens, self.gate_up_proj, tokens_per_expert, trans_b=True)
 
-        # SwiGLU
-        gate, up = fc1.chunk(2, dim=-1)       # each [N, I]
-        h = F.silu(gate) * up                  # [N, I]
+        # SwiGLU (fused: chunks [gate, up] internally, single kernel)
+        h = _fused_swiglu_concat(fc1)          # [N, I]
 
         # Apply routing weights before down_proj (saves one pass)
         h = h * weights.unsqueeze(-1)          # [N, I]
@@ -447,7 +479,7 @@ class SusonoRoutedExperts(nn.Module):
             tok_idx = torch.where(expert_mask[eid])[0]
             x = tokens[tok_idx]
             gate_out, up_out = F.linear(x, self.gate_up_proj[eid]).chunk(2, dim=-1)
-            x = F.silu(gate_out) * up_out
+            x = _fused_silu_mul(gate_out, up_out)
             x = x * weights[tok_idx, None]
             x = F.linear(x, self.down_proj[eid])
             output.index_add_(0, tok_idx, x.to(output.dtype))
