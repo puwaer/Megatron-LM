@@ -265,6 +265,11 @@ class ManifoldConstrainedHyperConnection(nn.Module):
     ) -> Tensor:
         """Combine layer output with permutation-mixed residuals.
 
+        Uses the fused Triton kernel from
+        :mod:`megatron.core.fusions.fused_mhc_width_connection` when eligible
+        (GPU + bfloat16 + n==4 + user opted-in); otherwise falls back to the
+        pure-PyTorch elementwise path.
+
         Args:
             x_out:         Layer output [S, B, D].
             new_residuals: Permutation-mixed streams [S, B, n, D].
@@ -273,6 +278,19 @@ class ManifoldConstrainedHyperConnection(nn.Module):
         Returns:
             Updated multi-stream hidden states [n, S, B, D].
         """
+        n = new_residuals.shape[-2]
+        auto_fused_eligible = (
+            self.auto_use_fused_kernel
+            and x_out.is_cuda
+            and x_out.dtype == torch.bfloat16
+            and n == 4
+        )
+        if self.use_fused_kernel or auto_fused_eligible:
+            from megatron.core.fusions.fused_mhc_width_connection import (
+                fused_mhc_depth_connection,
+            )
+            return fused_mhc_depth_connection(x_out, new_residuals, beta)
+
         # beta: [S,B,n] → [S,B,n,1];  x_out: [S,B,D] → [S,B,1,D]
         output = (
             beta.unsqueeze(-1) * x_out.unsqueeze(-2) + new_residuals

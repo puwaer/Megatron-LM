@@ -126,6 +126,31 @@ def _pytorch_width_connection(
 
 if _TRITON_AVAILABLE:
 
+    _MHC_PROJ_AUTOTUNE_CONFIGS = [
+        triton.Config({'BLOCK_ND': bn}, num_warps=nw, num_stages=ns)
+        for bn in (64, 128, 256)
+        for nw in (4, 8)
+        for ns in (2, 3)
+    ]
+
+    _MHC_OUTPUT_AUTOTUNE_CONFIGS = [
+        triton.Config({'BLOCK_D': bd}, num_warps=nw, num_stages=ns)
+        for bd in (64, 128, 256)
+        for nw in (4, 8)
+        for ns in (2, 3)
+    ]
+
+    _MHC_DEPTH_AUTOTUNE_CONFIGS = [
+        triton.Config({'BLOCK_D': bd}, num_warps=nw, num_stages=ns)
+        for bd in (64, 128, 256, 512)
+        for nw in (2, 4, 8)
+        for ns in (2, 3)
+    ]
+
+    @triton.autotune(
+        configs=_MHC_PROJ_AUTOTUNE_CONFIGS,
+        key=['nD', 'n_alpha', 'N_ALPHA_PAD'],
+    )
     @triton.jit
     def _fused_mhc_wc_proj_kernel(
         # Inputs
@@ -142,7 +167,7 @@ if _TRITON_AVAILABLE:
         n_alpha: tl.constexpr,      # n + n_perms  (actual count, e.g. 28)
         n_beta: tl.constexpr,       # n
         N_ALPHA_PAD: tl.constexpr,  # next pow2 >= n + N_PERMS_PAD  (e.g. 64)
-        BLOCK_ND: tl.constexpr,
+        BLOCK_ND: tl.constexpr,     # autotuned
     ):
         """Pass 1: fused RMSNorm + linear projection for wc and dc.
 
@@ -205,6 +230,10 @@ if _TRITON_AVAILABLE:
         dc_base = token_id * n_beta
         tl.store(dc_ptr + dc_base + tl.arange(0, n_beta), acc_dc)
 
+    @triton.autotune(
+        configs=_MHC_OUTPUT_AUTOTUNE_CONFIGS,
+        key=['D', 'n', 'n_perms', 'N_ALPHA_PAD', 'N_PERMS_PAD'],
+    )
     @triton.jit
     def _fused_mhc_output_kernel(
         # Inputs
@@ -230,7 +259,7 @@ if _TRITON_AVAILABLE:
         n_beta: tl.constexpr,       # n
         N_ALPHA_PAD: tl.constexpr,  # next pow2 >= n + N_PERMS_PAD  (e.g. 64)
         N_PERMS_PAD: tl.constexpr,  # next pow2 >= n_perms  (e.g. 32)
-        BLOCK_D: tl.constexpr,
+        BLOCK_D: tl.constexpr,      # autotuned
     ):
         """Pass 2: compute alpha_pre, H_res (in registers), new_residuals, branch_input, beta."""
         token_id = tl.program_id(0)
@@ -315,6 +344,131 @@ if _TRITON_AVAILABLE:
             tl.store(out_ptr_base + 2 * D, nr_2.to(tl.bfloat16), mask=d_mask)
             tl.store(out_ptr_base + 3 * D, nr_3.to(tl.bfloat16), mask=d_mask)
 
+    # -----------------------------------------------------------------------
+    # Depth connection kernels:
+    #   output[s, t, d] = beta[t, s] * x_out[t, d] + new_residuals[t, s, d]
+    #   Stored in [n, T, D] layout directly (== permute(2,0,1,3) of [T,n,D]).
+    # -----------------------------------------------------------------------
+
+    @triton.autotune(
+        configs=_MHC_DEPTH_AUTOTUNE_CONFIGS,
+        key=['D', 'n'],
+    )
+    @triton.jit
+    def _fused_mhc_depth_fwd_kernel(
+        x_out_ptr,            # [T, D]
+        new_residuals_ptr,    # [T, n, D]
+        beta_ptr,             # [T, n]
+        output_ptr,           # [n, T, D]
+        T,
+        n: tl.constexpr,
+        D: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        t = tl.program_id(0)
+        s = tl.program_id(1)
+        if t >= T:
+            return
+
+        beta_s = tl.load(beta_ptr + t * n + s).to(tl.float32)
+
+        for d_blk in range(tl.cdiv(D, BLOCK_D)):
+            d_offs = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
+            d_mask = d_offs < D
+
+            x = tl.load(
+                x_out_ptr + t * D + d_offs, mask=d_mask, other=0.0
+            ).to(tl.float32)
+            nr = tl.load(
+                new_residuals_ptr + t * n * D + s * D + d_offs,
+                mask=d_mask, other=0.0,
+            ).to(tl.float32)
+
+            out = beta_s * x + nr
+            tl.store(
+                output_ptr + s * T * D + t * D + d_offs,
+                out.to(tl.bfloat16),
+                mask=d_mask,
+            )
+
+    @triton.autotune(
+        configs=_MHC_DEPTH_AUTOTUNE_CONFIGS,
+        key=['D', 'n'],
+    )
+    @triton.jit
+    def _fused_mhc_depth_bwd_kernel(
+        grad_output_ptr,      # [n, T, D]
+        x_out_ptr,            # [T, D]
+        beta_ptr,             # [T, n]
+        # Outputs
+        d_x_out_ptr,          # [T, D]
+        d_new_residuals_ptr,  # [T, n, D]
+        d_beta_ptr,           # [T, n]
+        T,
+        n: tl.constexpr,
+        D: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """One program per token t. Computes d_x_out, d_new_residuals, d_beta for all n streams."""
+        t = tl.program_id(0)
+        if t >= T:
+            return
+
+        beta = tl.load(beta_ptr + t * n + tl.arange(0, n)).to(tl.float32)  # [n]
+
+        # Accumulate d_beta across D blocks.
+        d_beta_acc = tl.zeros([n], dtype=tl.float32)
+
+        n_idx = tl.arange(0, n)
+
+        for d_blk in range(tl.cdiv(D, BLOCK_D)):
+            d_offs = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
+            d_mask = d_offs < D
+
+            # Load grad_output [n, BLOCK_D] for this t.
+            go_ptrs = (
+                grad_output_ptr
+                + n_idx[:, None] * (T * D)
+                + t * D
+                + d_offs[None, :]
+            )
+            go = tl.load(
+                go_ptrs, mask=d_mask[None, :], other=0.0
+            ).to(tl.float32)  # [n, BLOCK_D]
+
+            # Load x_out [BLOCK_D] for this t.
+            x = tl.load(
+                x_out_ptr + t * D + d_offs, mask=d_mask, other=0.0
+            ).to(tl.float32)  # [BLOCK_D]
+
+            # d_beta[s] += sum_d(go[s, d] * x[d])
+            d_beta_acc += tl.sum(go * x[None, :], axis=1)  # [n]
+
+            # d_x_out[d] = sum_s(beta[s] * go[s, d])
+            dx = tl.sum(beta[:, None] * go, axis=0)  # [BLOCK_D]
+            tl.store(
+                d_x_out_ptr + t * D + d_offs,
+                dx.to(tl.bfloat16),
+                mask=d_mask,
+            )
+
+            # d_new_residuals[s, d] = go[s, d]
+            dnr_ptrs = (
+                d_new_residuals_ptr
+                + t * n * D
+                + n_idx[:, None] * D
+                + d_offs[None, :]
+            )
+            tl.store(
+                dnr_ptrs, go.to(tl.bfloat16), mask=d_mask[None, :]
+            )
+
+        # Store d_beta [n] for this t.
+        tl.store(
+            d_beta_ptr + t * n + tl.arange(0, n),
+            d_beta_acc.to(tl.bfloat16),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Autograd Function wrapping the two-pass Triton kernels
@@ -349,8 +503,6 @@ if _TRITON_AVAILABLE:
             n_beta = n
             N_PERMS_PAD = _next_pow2(n_perms)           # 24 → 32
             N_ALPHA_PAD = _next_pow2(n + N_PERMS_PAD)   # 36 → 64
-            BLOCK_ND = min(128, nD)
-            BLOCK_D = min(128, D)
 
             # Scratch buffers: wc uses padded size; zeros() ensures padding elements are 0
             wc_scratch = torch.zeros((T, N_ALPHA_PAD), dtype=torch.float32, device=device)
@@ -365,15 +517,16 @@ if _TRITON_AVAILABLE:
             X_flat_nd = X_flat.reshape(T, nD)
 
             # Pass 1: fused RMSNorm + projection → wc, dc scratch buffers
+            # BLOCK_ND / num_warps / num_stages are picked by @triton.autotune.
             _fused_mhc_wc_proj_kernel[(T,)](
                 X_flat_nd, W_alpha, W_beta, gamma,
                 wc_scratch, dc_scratch,
                 T=T, nD=nD, n_alpha=n_alpha, n_beta=n_beta,
                 N_ALPHA_PAD=N_ALPHA_PAD,
-                BLOCK_ND=BLOCK_ND,
             )
 
             # Pass 2: compute alpha_pre, H_res (in registers), outputs
+            # BLOCK_D / num_warps / num_stages are picked by @triton.autotune.
             _fused_mhc_output_kernel[(T,)](
                 X_flat,          # [T, n, D] for stream-aware access
                 wc_scratch, dc_scratch,
@@ -385,7 +538,6 @@ if _TRITON_AVAILABLE:
                 branch_input, new_residuals, beta_out,
                 T=T, n=n, D=D, n_alpha=n_alpha, n_perms=n_perms, n_beta=n_beta,
                 N_ALPHA_PAD=N_ALPHA_PAD, N_PERMS_PAD=N_PERMS_PAD,
-                BLOCK_D=BLOCK_D,
             )
 
             ctx.save_for_backward(
@@ -434,6 +586,99 @@ if _TRITON_AVAILABLE:
                 g(pbs_d), g(rs_d), g(hps_d),
                 None, None, None, None, # T, n, D, n_perms
             )
+
+
+# ---------------------------------------------------------------------------
+# Depth-connection autograd Function (Triton forward & backward)
+# ---------------------------------------------------------------------------
+
+if _TRITON_AVAILABLE:
+
+    class _FusedMHCDepthFunction(torch.autograd.Function):
+        """Fused depth connection.
+
+        Forward:  output[s, t, d] = beta[t, s] * x_out[t, d] + new_residuals[t, s, d]
+        Layout:   output is returned in [n, T, D] = permute(2, 0, 1, 3) order,
+                  which is what ``_depth_connection`` needs to feed back into
+                  SusonoBlock as ``[n, S, B, D]``.
+
+        Backward computes d_x_out, d_new_residuals, d_beta directly from
+        grad_output in a single per-token kernel (no PyTorch recompute).
+        """
+
+        @staticmethod
+        def forward(ctx, x_out, new_residuals, beta):
+            # x_out:         [T, D]
+            # new_residuals: [T, n, D]
+            # beta:          [T, n]
+            T, n, D = new_residuals.shape
+            output = torch.empty(
+                (n, T, D), dtype=x_out.dtype, device=x_out.device,
+            )
+            _fused_mhc_depth_fwd_kernel[(T, n)](
+                x_out, new_residuals, beta, output,
+                T=T, n=n, D=D,
+            )
+            ctx.save_for_backward(x_out, beta)
+            ctx.T, ctx.n, ctx.D = T, n, D
+            return output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x_out, beta = ctx.saved_tensors
+            T, n, D = ctx.T, ctx.n, ctx.D
+
+            grad_output_c = grad_output.contiguous()
+
+            d_x_out = torch.empty_like(x_out)
+            d_new_residuals = torch.empty(
+                (T, n, D), dtype=x_out.dtype, device=x_out.device,
+            )
+            d_beta = torch.empty_like(beta)
+
+            _fused_mhc_depth_bwd_kernel[(T,)](
+                grad_output_c, x_out, beta,
+                d_x_out, d_new_residuals, d_beta,
+                T=T, n=n, D=D,
+            )
+            return d_x_out, d_new_residuals, d_beta
+
+
+def fused_mhc_depth_connection(
+    x_out: Tensor,
+    new_residuals: Tensor,
+    beta: Tensor,
+) -> Tensor:
+    """Fused MHC depth connection with Triton forward & backward.
+
+    Args:
+        x_out:         [S, B, D]       — transformer layer output (single-stream).
+        new_residuals: [S, B, n, D]    — permutation-mixed residuals from width.
+        beta:          [S, B, n]       — per-stream gate weights.
+
+    Returns:
+        [n, S, B, D] multi-stream hidden states, ready to feed the next layer.
+    """
+    S, B, n, D = new_residuals.shape
+    T = S * B
+
+    use_triton = (
+        _TRITON_AVAILABLE
+        and x_out.is_cuda
+        and x_out.dtype == torch.bfloat16
+        and n == 4
+    )
+
+    if use_triton:
+        x_out_t = x_out.reshape(T, D).contiguous()
+        new_residuals_t = new_residuals.reshape(T, n, D).contiguous()
+        beta_t = beta.reshape(T, n).contiguous()
+        output = _FusedMHCDepthFunction.apply(x_out_t, new_residuals_t, beta_t)
+        return output.view(n, S, B, D)
+
+    # Pure-PyTorch fallback (unchanged from previous behaviour).
+    output = beta.unsqueeze(-1) * x_out.unsqueeze(-2) + new_residuals
+    return output.permute(2, 0, 1, 3).contiguous()
 
 
 # ---------------------------------------------------------------------------
