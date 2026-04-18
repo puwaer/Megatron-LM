@@ -179,3 +179,118 @@ def test_fused_width_forward_matches_reference_bf16():
     assert torch.allclose(bi.float(), bi_r.float(), rtol=5e-2, atol=5e-2)
     assert torch.allclose(nr.float(), nr_r.float(), rtol=5e-2, atol=5e-2)
     assert torch.allclose(beta.float(), beta_r.float(), rtol=5e-2, atol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# Width connection backward (Triton vs PyTorch-recompute reference)
+# ---------------------------------------------------------------------------
+
+
+def _make_width_inputs(n=4, S=4, B=2, D=64, seed=7):
+    """Build a fresh set of MHC width-connection parameters + input."""
+    import itertools
+    torch.manual_seed(seed)
+    n_perms = math.factorial(n)
+
+    X = (torch.randn(n, S, B, D, dtype=torch.bfloat16, device="cuda") * 0.1)
+    W_alpha = (torch.randn(
+        n * D, n + n_perms, dtype=torch.bfloat16, device="cuda",
+    ) * 0.01)
+    W_beta = torch.randn(n * D, n, dtype=torch.bfloat16, device="cuda") * 0.01
+    static_alpha = torch.randn(n + n_perms, dtype=torch.bfloat16, device="cuda")
+    static_beta = torch.ones(n, dtype=torch.bfloat16, device="cuda") * -8.0
+    gamma = torch.zeros(n * D, dtype=torch.bfloat16, device="cuda")
+    pbs = torch.tensor([1e-2], dtype=torch.float32, device="cuda")
+    rs = torch.tensor([1e-2], dtype=torch.float32, device="cuda")
+    hps = torch.tensor([1e-2], dtype=torch.float32, device="cuda")
+
+    perms = list(itertools.permutations(range(n)))
+    eye = torch.eye(n, dtype=torch.float32, device="cuda")
+    idx = torch.tensor(perms, dtype=torch.long, device="cuda")
+    perms_tensor = eye[idx].to(torch.bfloat16)
+
+    return {
+        "X": X, "W_alpha": W_alpha, "W_beta": W_beta,
+        "static_alpha": static_alpha, "static_beta": static_beta,
+        "gamma": gamma, "pbs": pbs, "rs": rs, "hps": hps,
+        "perms": perms_tensor, "n": n, "S": S, "B": B, "D": D,
+    }
+
+
+def _run_width_bwd(backend: str, inputs: dict):
+    """Run forward+backward with the specified backend and return (grads, outputs)."""
+    import os
+    from megatron.core.fusions import fused_mhc_width_connection as mod
+
+    # Configure backend BEFORE importing the module is too late — it reads env
+    # at import time.  Override the module-level flag directly.
+    prev_mode = mod._WIDTH_BWD_MODE
+    mod._WIDTH_BWD_MODE = backend
+    try:
+        # Fresh leaf tensors with grad.
+        X = inputs["X"].detach().clone().requires_grad_(True)
+        W_alpha = inputs["W_alpha"].detach().clone().requires_grad_(True)
+        W_beta = inputs["W_beta"].detach().clone().requires_grad_(True)
+        static_alpha = inputs["static_alpha"].detach().clone().requires_grad_(True)
+        static_beta = inputs["static_beta"].detach().clone().requires_grad_(True)
+        gamma = inputs["gamma"].detach().clone().requires_grad_(True)
+        pbs = inputs["pbs"].detach().clone().requires_grad_(True)
+        rs = inputs["rs"].detach().clone().requires_grad_(True)
+        hps = inputs["hps"].detach().clone().requires_grad_(True)
+
+        bi, nr, beta = mod.fused_mhc_width_connection(
+            X, W_alpha, W_beta, static_alpha, static_beta, gamma,
+            inputs["perms"], pbs, rs, hps,
+        )
+        # Deterministic upstream: sum of each output (matches gradients=1 of unit).
+        torch.manual_seed(101)
+        up_bi = torch.randn_like(bi)
+        up_nr = torch.randn_like(nr)
+        up_beta = torch.randn_like(beta)
+        loss = (bi * up_bi).sum() + (nr * up_nr).sum() + (beta * up_beta).sum()
+        loss.backward()
+
+        return {
+            "X_grad": X.grad, "Wa_grad": W_alpha.grad, "Wb_grad": W_beta.grad,
+            "sa_grad": static_alpha.grad, "sb_grad": static_beta.grad,
+            "g_grad": gamma.grad,
+            "pbs_grad": pbs.grad, "rs_grad": rs.grad, "hps_grad": hps.grad,
+            "bi": bi.detach(), "nr": nr.detach(), "beta": beta.detach(),
+        }
+    finally:
+        mod._WIDTH_BWD_MODE = prev_mode
+
+
+def _grad_close(a, b, rtol, atol, name):
+    diff = (a.float() - b.float()).abs()
+    ref_scale = b.float().abs().max().item() + 1e-9
+    assert torch.allclose(a.float(), b.float(), rtol=rtol, atol=atol), (
+        f"{name}: max diff {diff.max().item():.3e}, max ref {ref_scale:.3e}, "
+        f"rtol={rtol}, atol={atol}"
+    )
+
+
+def test_fused_width_backward_matches_pytorch_bf16():
+    """Triton width backward must match the PyTorch-recompute reference
+    within bf16 numerical noise."""
+    inputs = _make_width_inputs()
+
+    out_py = _run_width_bwd("pytorch", inputs)
+    out_triton = _run_width_bwd("triton", inputs)
+
+    # Forward outputs are unrelated to backend selection but worth double-checking.
+    _grad_close(out_py["bi"], out_triton["bi"], rtol=5e-2, atol=5e-2, name="bi")
+    _grad_close(out_py["nr"], out_triton["nr"], rtol=5e-2, atol=5e-2, name="nr")
+    _grad_close(out_py["beta"], out_triton["beta"], rtol=5e-2, atol=5e-2, name="beta")
+
+    # Backward tolerances: bf16 accumulation noise can be sizeable, especially
+    # for softmax backward of 24 perms.
+    _grad_close(out_py["X_grad"], out_triton["X_grad"], rtol=5e-2, atol=5e-2, name="X_grad")
+    _grad_close(out_py["Wa_grad"], out_triton["Wa_grad"], rtol=5e-2, atol=5e-2, name="Wa_grad")
+    _grad_close(out_py["Wb_grad"], out_triton["Wb_grad"], rtol=5e-2, atol=5e-2, name="Wb_grad")
+    _grad_close(out_py["sa_grad"], out_triton["sa_grad"], rtol=1e-1, atol=1e-1, name="sa_grad")
+    _grad_close(out_py["sb_grad"], out_triton["sb_grad"], rtol=5e-2, atol=5e-2, name="sb_grad")
+    _grad_close(out_py["g_grad"], out_triton["g_grad"], rtol=5e-2, atol=5e-2, name="g_grad")
+    _grad_close(out_py["pbs_grad"], out_triton["pbs_grad"], rtol=1e-1, atol=1e-1, name="pbs_grad")
+    _grad_close(out_py["rs_grad"], out_triton["rs_grad"], rtol=1e-1, atol=1e-1, name="rs_grad")
+    _grad_close(out_py["hps_grad"], out_triton["hps_grad"], rtol=1e-1, atol=1e-1, name="hps_grad")

@@ -47,9 +47,11 @@ Requirements:
 """
 
 import math
+import os
 from typing import Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 try:
@@ -58,6 +60,12 @@ try:
     _TRITON_AVAILABLE = True
 except ImportError:
     _TRITON_AVAILABLE = False
+
+
+# Flag to select the MHC width-connection backward implementation.
+# Set SUSONO_MHC_WIDTH_BWD=pytorch to force the old recompute-based path
+# (useful for debugging the Triton backward).  Default: triton.
+_WIDTH_BWD_MODE = os.environ.get('SUSONO_MHC_WIDTH_BWD', 'triton').lower()
 
 
 def _next_pow2(n: int) -> int:
@@ -469,6 +477,298 @@ if _TRITON_AVAILABLE:
             d_beta_acc.to(tl.bfloat16),
         )
 
+    # -----------------------------------------------------------------------
+    # Width backward kernels:
+    #   Pass-B1: token-local gradients (res_coeff, alpha_pre, H_res, beta)
+    #   Pass-B2: RMSNorm backward + combine d_X_partial into d_X
+    # cuBLAS (PyTorch) handles d_W_alpha, d_W_beta, d_normed between the two.
+    # -----------------------------------------------------------------------
+
+    _MHC_BWD1_AUTOTUNE_CONFIGS = [
+        triton.Config({'BLOCK_D': bd}, num_warps=nw, num_stages=ns)
+        for bd in (64, 128, 256)
+        for nw in (4, 8)
+        for ns in (2, 3)
+    ]
+
+    # NOTE: no @triton.autotune on the backward kernel.  The atomic_add
+    # accumulators cannot safely tolerate repeated kernel invocations
+    # during autotune benchmarking (side effects accumulate across runs,
+    # and reset_to_zero isn't fully effective with Triton 3.6 for our
+    # layout).  Use a fixed BLOCK_D / num_warps / num_stages instead and
+    # rely on the cache hit for subsequent runs.
+    @triton.jit
+    def _fused_mhc_wc_bwd1_kernel(
+        # Inputs
+        X_ptr,                # [T, n, D]       bf16
+        perms_ptr,            # [n_perms*n*n]   bf16 or fp32
+        alpha_pre_ptr,        # [T, n]          fp32  (recomputed)
+        res_coeff_ptr,        # [T, n_perms]    fp32  (recomputed)
+        beta_ptr,             # [T, n]          fp32  (recomputed)
+        wc_pre_ptr,           # [T, n]          fp32  (slice of wc_scratch)
+        wc_res_ptr,           # [T, n_perms]    fp32  (slice of wc_scratch)
+        dc_ptr,               # [T, n]          fp32  (dc_scratch)
+        grad_branch_ptr,      # [T, D]          bf16
+        grad_res_ptr,         # [T, n, D]       bf16
+        grad_beta_ptr,        # [T, n]          bf16
+        # Outputs (pre-allocated)
+        d_wc_ptr,             # [T, n_alpha]    fp32  (wc_pre | wc_res layout)
+        d_dc_ptr,             # [T, n]          fp32
+        d_X_partial_ptr,      # [T, n, D]       bf16
+        # Atomic accumulators (fp32)
+        d_static_alpha_acc_ptr,   # [n_alpha]
+        d_static_beta_acc_ptr,    # [n]
+        d_pbs_acc_ptr,            # [1]
+        d_rs_acc_ptr,             # [1]
+        d_hps_acc_ptr,            # [1]
+        # Scalar scales
+        pre_branch_scale,     # float
+        residual_scale,       # float
+        h_post_scale,         # float
+        # Dims
+        T,
+        n: tl.constexpr,
+        D: tl.constexpr,
+        n_perms: tl.constexpr,
+        n_alpha: tl.constexpr,      # n + n_perms
+        N_PERMS_PAD: tl.constexpr,  # next pow2 >= n_perms
+        BLOCK_D: tl.constexpr,
+    ):
+        """One program per token.
+
+        Computes the per-token contribution to every gradient that depends
+        on outputs other than the normed tensor.  d_W_alpha, d_W_beta and
+        d_normed are computed via cuBLAS GEMMs outside Triton.
+        """
+        t = tl.program_id(0)
+        if t >= T:
+            return
+
+        cols_n = tl.arange(0, n)
+        res_idx = tl.arange(0, N_PERMS_PAD)
+        res_mask = res_idx < n_perms
+
+        # ---- Load recomputed activations / scratch ----
+        alpha_pre = tl.load(alpha_pre_ptr + t * n + cols_n).to(tl.float32)   # [n]
+        beta = tl.load(beta_ptr + t * n + cols_n).to(tl.float32)             # [n]
+        res_coeff = tl.load(
+            res_coeff_ptr + t * n_perms + res_idx,
+            mask=res_mask, other=0.0,
+        ).to(tl.float32)                                                      # [N_PERMS_PAD]
+        wc_pre = tl.load(wc_pre_ptr + t * n + cols_n).to(tl.float32)         # [n]
+        wc_res = tl.load(
+            wc_res_ptr + t * n_perms + res_idx,
+            mask=res_mask, other=0.0,
+        ).to(tl.float32)                                                      # [N_PERMS_PAD]
+        dc = tl.load(dc_ptr + t * n + cols_n).to(tl.float32)                  # [n]
+
+        grad_beta_v = tl.load(
+            grad_beta_ptr + t * n + cols_n
+        ).to(tl.float32)                                                      # [n]
+
+        # ---- beta = 2 * sigmoid(logit_beta)  →  backward ----
+        # d logit_beta = d_beta * 2 * sigmoid'(logit) = d_beta * beta * (1 - beta/2)
+        d_logit_beta = grad_beta_v * beta * (1.0 - beta * 0.5)               # [n]
+        d_dc = d_logit_beta * h_post_scale                                    # [n]
+        tl.store(d_dc_ptr + t * n + cols_n, d_dc)
+
+        # d_static_beta accumulates d_logit_beta per element
+        tl.atomic_add(d_static_beta_acc_ptr + cols_n, d_logit_beta)
+        # d_hps accumulates sum over n of d_logit_beta * dc
+        tl.atomic_add(d_hps_acc_ptr, tl.sum(d_logit_beta * dc))
+
+        # ---- Build H_res [n, n] from res_coeff and perms ----
+        #   H_res[i, j] = sum_r(res_coeff[r] * perms[r, i, j])
+        i_idx = cols_n
+        j_idx = cols_n
+        p_all = tl.load(
+            perms_ptr
+            + res_idx[:, None, None] * (n * n)
+            + i_idx[None, :, None] * n
+            + j_idx[None, None, :],
+            mask=res_mask[:, None, None], other=0.0,
+        ).to(tl.float32)                                                      # [N_PERMS_PAD, n, n]
+        H_res = tl.sum(res_coeff[:, None, None] * p_all, axis=0)             # [n, n]
+
+        # ---- Iterate over D to compute d_alpha_pre, d_H_res, d_X_partial ----
+        d_alpha_pre = tl.zeros([n], dtype=tl.float32)
+        d_H_res = tl.zeros([n, n], dtype=tl.float32)
+
+        x_base = t * n * D
+
+        for d_blk in range(tl.cdiv(D, BLOCK_D)):
+            d_offs = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
+            d_mask = d_offs < D
+
+            x_ptrs = X_ptr + x_base + cols_n[:, None] * D + d_offs[None, :]
+            x_chunk = tl.load(
+                x_ptrs, mask=d_mask[None, :], other=0.0,
+            ).to(tl.float32)                                                  # [n, BLOCK_D]
+
+            gb = tl.load(
+                grad_branch_ptr + t * D + d_offs,
+                mask=d_mask, other=0.0,
+            ).to(tl.float32)                                                  # [BLOCK_D]
+
+            gr_ptrs = (
+                grad_res_ptr + x_base + cols_n[:, None] * D + d_offs[None, :]
+            )
+            gr_chunk = tl.load(
+                gr_ptrs, mask=d_mask[None, :], other=0.0,
+            ).to(tl.float32)                                                  # [n, BLOCK_D]
+
+            # d_alpha_pre[s] += sum_d(gb[d] * x[s, d])
+            d_alpha_pre += tl.sum(gb[None, :] * x_chunk, axis=1)
+
+            # d_H_res[i, j] += sum_d(gr[i, d] * x[j, d])
+            d_H_res += tl.sum(
+                gr_chunk[:, None, :] * x_chunk[None, :, :], axis=2,
+            )                                                                 # [n, n]
+
+            # d_X_from_branch[s, d] = alpha_pre[s] * gb[d]
+            dx_branch = alpha_pre[:, None] * gb[None, :]                     # [n, BLOCK_D]
+
+            # d_X_from_res[j, d] = sum_i(H_res[i, j] * gr[i, d])
+            dx_res = tl.sum(
+                H_res[:, :, None] * gr_chunk[:, None, :], axis=0,
+            )                                                                 # [n, BLOCK_D]
+
+            dx_partial = dx_branch + dx_res
+            dp_ptrs = (
+                d_X_partial_ptr
+                + x_base + cols_n[:, None] * D + d_offs[None, :]
+            )
+            tl.store(dp_ptrs, dx_partial.to(tl.bfloat16), mask=d_mask[None, :])
+
+        # ---- alpha_pre → wc_pre ----
+        # alpha_pre = sigmoid(logit_pre); d_logit = d_alpha * alpha * (1 - alpha)
+        d_logit_pre = d_alpha_pre * alpha_pre * (1.0 - alpha_pre)            # [n]
+        d_wc_pre = d_logit_pre * pre_branch_scale                            # [n]
+
+        # ---- d_H_res → d_res_coeff, softmax backward → d_wc_res ----
+        # d_res_coeff[r] = sum_{i,j}(d_H_res[i, j] * perms[r, i, j])
+        d_res_coeff_padded = tl.sum(
+            tl.sum(p_all * d_H_res[None, :, :], axis=2), axis=1,
+        )                                                                     # [N_PERMS_PAD]
+        # Ensure padded positions are zero (they were during load, but
+        # the sum may leak non-zero from uninitialized mask regions).
+        d_res_coeff_padded = tl.where(res_mask, d_res_coeff_padded, 0.0)
+
+        # softmax backward: d_logit = y * (d_y - <y, d_y>)
+        inner = tl.sum(d_res_coeff_padded * res_coeff)
+        d_logit_res = res_coeff * (d_res_coeff_padded - inner)               # [N_PERMS_PAD]
+        d_wc_res = d_logit_res * residual_scale
+
+        # ---- Zero-clamp padded positions so out-of-range atomic_add/store
+        # ops are harmless no-ops (add 0 / write 0 at a safe in-range index)
+        # regardless of how Triton translates masked pointer arithmetic.
+        d_logit_res_safe = tl.where(res_mask, d_logit_res, 0.0)
+        d_wc_res_safe = tl.where(res_mask, d_wc_res, 0.0)
+        # Clamp res_idx to 0 for masked lanes (first element is a safe target).
+        safe_res_idx = tl.where(res_mask, res_idx, 0)
+
+        # Atomic reductions for static_alpha
+        tl.atomic_add(d_static_alpha_acc_ptr + cols_n, d_logit_pre)
+        tl.atomic_add(
+            d_static_alpha_acc_ptr + n + safe_res_idx,
+            d_logit_res_safe,
+        )
+
+        # Atomic reductions for pbs, rs scalars (no mask needed — zeroed lanes)
+        tl.atomic_add(d_pbs_acc_ptr, tl.sum(d_logit_pre * wc_pre))
+        tl.atomic_add(d_rs_acc_ptr, tl.sum(d_logit_res_safe * wc_res))
+
+        # ---- Store d_wc = [d_wc_pre | d_wc_res] in [T, n_alpha] layout ----
+        tl.store(d_wc_ptr + t * n_alpha + cols_n, d_wc_pre)
+        tl.store(
+            d_wc_ptr + t * n_alpha + n + safe_res_idx,
+            d_wc_res_safe,
+        )
+
+    _MHC_BWD2_AUTOTUNE_CONFIGS = [
+        triton.Config({'BLOCK_ND': bn}, num_warps=nw, num_stages=ns)
+        for bn in (64, 128, 256, 512)
+        for nw in (4, 8)
+        for ns in (2, 3)
+    ]
+
+    @triton.autotune(
+        configs=_MHC_BWD2_AUTOTUNE_CONFIGS,
+        key=['nD'],
+    )
+    @triton.jit
+    def _fused_mhc_wc_bwd2_kernel(
+        X_ptr,                # [T, nD]    bf16  (== X_flat reshaped)
+        gamma_ptr,            # [nD]       bf16 or fp32
+        d_normed_ptr,         # [T, nD]    bf16
+        d_X_partial_ptr,      # [T, nD]    bf16  (from Pass-B1)
+        inv_rms_ptr,          # [T]        fp32  (precomputed outside)
+        # Output
+        d_X_ptr,              # [T, nD]    bf16
+        T,
+        nD: tl.constexpr,
+        BLOCK_ND: tl.constexpr,
+    ):
+        """RMSNorm backward combined with d_X_partial.
+
+        For each token t, with c = inv_rms[t] (== rsqrt(mean(x^2) + eps)):
+            normed[i] = x[i] * c * (gamma[i] + 1)
+            d_x[j]_rms = c * (g_p1[j] * d_normed[j] - x[j] * c^2 * inner / nD)
+              where inner = sum_i(x[i] * g_p1[i] * d_normed[i])
+            d_X[t, j] = d_x_rms + d_X_partial[t, j]
+        """
+        t = tl.program_id(0)
+        if t >= T:
+            return
+
+        c = tl.load(inv_rms_ptr + t).to(tl.float32)  # scalar
+
+        x_base = t * nD
+
+        # Pass A: compute inner = sum_i(x * (gamma + 1) * d_normed)
+        inner = tl.zeros([1], dtype=tl.float32)
+        for _blk in range(tl.cdiv(nD, BLOCK_ND)):
+            offs = _blk * BLOCK_ND + tl.arange(0, BLOCK_ND)
+            mask = offs < nD
+            x = tl.load(
+                X_ptr + x_base + offs, mask=mask, other=0.0,
+            ).to(tl.float32)
+            dn = tl.load(
+                d_normed_ptr + x_base + offs, mask=mask, other=0.0,
+            ).to(tl.float32)
+            g = tl.load(
+                gamma_ptr + offs, mask=mask, other=0.0,
+            ).to(tl.float32)
+            inner += tl.sum(x * (g + 1.0) * dn)
+
+        c_sq_over_nD = c * c / nD
+
+        # Pass B: emit d_X = d_X_rms + d_X_partial
+        for _blk in range(tl.cdiv(nD, BLOCK_ND)):
+            offs = _blk * BLOCK_ND + tl.arange(0, BLOCK_ND)
+            mask = offs < nD
+            x = tl.load(
+                X_ptr + x_base + offs, mask=mask, other=0.0,
+            ).to(tl.float32)
+            dn = tl.load(
+                d_normed_ptr + x_base + offs, mask=mask, other=0.0,
+            ).to(tl.float32)
+            g = tl.load(
+                gamma_ptr + offs, mask=mask, other=0.0,
+            ).to(tl.float32)
+            dxp = tl.load(
+                d_X_partial_ptr + x_base + offs, mask=mask, other=0.0,
+            ).to(tl.float32)
+
+            g_p1 = g + 1.0
+            d_x_rms = c * (g_p1 * dn - x * c_sq_over_nD * inner)
+            d_x = d_x_rms + dxp
+            tl.store(
+                d_X_ptr + x_base + offs,
+                d_x.to(tl.bfloat16),
+                mask=mask,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Autograd Function wrapping the two-pass Triton kernels
@@ -540,52 +840,262 @@ if _TRITON_AVAILABLE:
                 N_ALPHA_PAD=N_ALPHA_PAD, N_PERMS_PAD=N_PERMS_PAD,
             )
 
+            # Save scratch buffers so backward can re-derive activations
+            # (alpha_pre / res_coeff / beta) without an extra Pass-1 launch.
             ctx.save_for_backward(
                 X_flat, W_alpha, W_beta,
                 static_alpha, static_beta, gamma,
                 perms_flat,
                 pre_branch_scale, residual_scale, h_post_scale,
+                wc_scratch, dc_scratch,
             )
             ctx.T, ctx.n, ctx.D, ctx.n_perms = T, n, D, n_perms
             return branch_input, new_residuals, beta_out
 
         @staticmethod
         def backward(ctx, grad_branch, grad_res, grad_beta):
-            """Backward: recompute forward in PyTorch, then differentiate."""
+            """Width-connection backward.
+
+            Default path: all-Triton + cuBLAS, direct gradient computation.
+            Fallback path (`SUSONO_MHC_WIDTH_BWD=pytorch`): recompute the
+            forward in PyTorch and use autograd — slower but independent of
+            the custom kernels (useful for debugging).
+            """
+            saved = ctx.saved_tensors
             (X_flat, W_alpha, W_beta,
              static_alpha, static_beta, gamma,
              perms_flat,
-             pbs, rs, hps) = ctx.saved_tensors
+             pbs, rs, hps,
+             wc_scratch, dc_scratch) = saved
             T, n, D, n_perms = ctx.T, ctx.n, ctx.D, ctx.n_perms
 
-            def attach(t):
-                return t.detach().requires_grad_(t.requires_grad)
-
-            X_d, Wa_d, Wb_d = attach(X_flat), attach(W_alpha), attach(W_beta)
-            sa_d, sb_d, g_d = attach(static_alpha), attach(static_beta), attach(gamma)
-            pbs_d, rs_d, hps_d = attach(pbs), attach(rs), attach(hps)
-
-            with torch.enable_grad():
-                bi_r, nr_r, beta_r = _pytorch_width_connection(
-                    X_d, Wa_d, Wb_d, sa_d, sb_d, g_d,
-                    perms_flat, pbs_d, rs_d, hps_d,
+            if _WIDTH_BWD_MODE == 'pytorch':
+                return _pytorch_recompute_backward(
+                    grad_branch, grad_res, grad_beta,
+                    X_flat, W_alpha, W_beta,
+                    static_alpha, static_beta, gamma,
+                    perms_flat, pbs, rs, hps,
                     T, n, D, n_perms,
                 )
-                torch.autograd.backward(
-                    (bi_r, nr_r, beta_r),
-                    (grad_branch, grad_res, grad_beta),
-                )
 
-            def g(t):
-                return t.grad if t.requires_grad else None
-
-            return (
-                g(X_d), g(Wa_d), g(Wb_d),
-                g(sa_d), g(sb_d), g(g_d),
-                None,                   # perms_flat — constant
-                g(pbs_d), g(rs_d), g(hps_d),
-                None, None, None, None, # T, n, D, n_perms
+            return _triton_width_backward(
+                grad_branch, grad_res, grad_beta,
+                X_flat, W_alpha, W_beta,
+                static_alpha, static_beta, gamma,
+                perms_flat, pbs, rs, hps,
+                wc_scratch, dc_scratch,
+                T, n, D, n_perms,
             )
+
+
+def _pytorch_recompute_backward(
+    grad_branch, grad_res, grad_beta,
+    X_flat, W_alpha, W_beta,
+    static_alpha, static_beta, gamma,
+    perms_flat, pbs, rs, hps,
+    T, n, D, n_perms,
+):
+    """Legacy backward path: re-run the PyTorch reference forward under
+    ``torch.enable_grad`` and drive ``torch.autograd.backward``.  Gated by
+    ``SUSONO_MHC_WIDTH_BWD=pytorch``.
+    """
+    def attach(t):
+        return t.detach().requires_grad_(t.requires_grad)
+
+    X_d, Wa_d, Wb_d = attach(X_flat), attach(W_alpha), attach(W_beta)
+    sa_d, sb_d, g_d = attach(static_alpha), attach(static_beta), attach(gamma)
+    pbs_d, rs_d, hps_d = attach(pbs), attach(rs), attach(hps)
+
+    with torch.enable_grad():
+        bi_r, nr_r, beta_r = _pytorch_width_connection(
+            X_d, Wa_d, Wb_d, sa_d, sb_d, g_d,
+            perms_flat, pbs_d, rs_d, hps_d,
+            T, n, D, n_perms,
+        )
+        torch.autograd.backward(
+            (bi_r, nr_r, beta_r),
+            (grad_branch, grad_res, grad_beta),
+        )
+
+    def g(t):
+        return t.grad if t.requires_grad else None
+
+    return (
+        g(X_d), g(Wa_d), g(Wb_d),
+        g(sa_d), g(sb_d), g(g_d),
+        None,                   # perms_flat — constant
+        g(pbs_d), g(rs_d), g(hps_d),
+        None, None, None, None, # T, n, D, n_perms
+    )
+
+
+# ---------------------------------------------------------------------------
+# Triton-backend backward driver for width connection
+# ---------------------------------------------------------------------------
+
+if _TRITON_AVAILABLE:
+
+    def _triton_width_backward(
+        grad_branch: Tensor,   # [T, D]
+        grad_res: Tensor,      # [T, n, D]
+        grad_beta: Tensor,     # [T, n]
+        # Saved from forward:
+        X_flat: Tensor,        # [T, n, D]
+        W_alpha: Tensor,       # [nD, n_alpha]
+        W_beta: Tensor,        # [nD, n]
+        static_alpha: Tensor,  # [n_alpha]
+        static_beta: Tensor,   # [n]
+        gamma: Tensor,         # [nD]
+        perms_flat: Tensor,    # [n_perms, n, n]
+        pre_branch_scale: Tensor,
+        residual_scale: Tensor,
+        h_post_scale: Tensor,
+        wc_scratch: Tensor,    # [T, N_ALPHA_PAD] fp32
+        dc_scratch: Tensor,    # [T, n]           fp32
+        T: int,
+        n: int,
+        D: int,
+        n_perms: int,
+    ):
+        """All-Triton (plus cuBLAS GEMMs) backward for _width_connection.
+
+        Layout of returned gradients matches the ``_FusedMHCWidthFunction.forward``
+        inputs: (X_flat, W_alpha, W_beta, static_alpha, static_beta, gamma,
+                 perms_flat, pbs, rs, hps, T, n, D, n_perms).
+        """
+        nD = n * D
+        n_alpha = n + n_perms
+        device = X_flat.device
+
+        # Contiguify gradient tensors (autograd may pass non-contiguous).
+        grad_branch = grad_branch.contiguous()
+        grad_res = grad_res.contiguous()
+        grad_beta = grad_beta.contiguous()
+
+        # ------------------------------------------------------------------
+        # Recompute alpha_pre / res_coeff / beta from saved scratches.  These
+        # are small and cheap; saving them would cost extra memory.
+        # ------------------------------------------------------------------
+        wc_pre = wc_scratch[:, :n].contiguous()                               # [T, n]
+        wc_res = wc_scratch[:, n:n + n_perms].contiguous()                    # [T, n_perms]
+
+        pbs_f = float(pre_branch_scale.item())
+        rs_f = float(residual_scale.item())
+        hps_f = float(h_post_scale.item())
+
+        sa_pre = static_alpha[:n].to(torch.float32)
+        sa_res = static_alpha[n:n + n_perms].to(torch.float32)
+        sb = static_beta.to(torch.float32)
+
+        alpha_pre_f = torch.sigmoid(pbs_f * wc_pre + sa_pre)                 # [T, n] fp32
+        logit_res = rs_f * wc_res + sa_res
+        res_coeff_f = torch.softmax(logit_res, dim=-1)                       # [T, n_perms]
+        beta_f = torch.sigmoid(hps_f * dc_scratch + sb) * 2.0                # [T, n]
+
+        # ------------------------------------------------------------------
+        # Pass-B1: launch Triton kernel for token-local gradients
+        # ------------------------------------------------------------------
+        d_wc = torch.zeros((T, n_alpha), dtype=torch.float32, device=device)
+        d_dc = torch.empty((T, n), dtype=torch.float32, device=device)
+        d_X_partial = torch.empty((T, n, D), dtype=X_flat.dtype, device=device)
+
+        d_static_alpha_acc = torch.zeros(n_alpha, dtype=torch.float32, device=device)
+        d_static_beta_acc = torch.zeros(n, dtype=torch.float32, device=device)
+        d_pbs_acc = torch.zeros(1, dtype=torch.float32, device=device)
+        d_rs_acc = torch.zeros(1, dtype=torch.float32, device=device)
+        d_hps_acc = torch.zeros(1, dtype=torch.float32, device=device)
+
+        N_PERMS_PAD = _next_pow2(n_perms)
+        # Fixed block size / occupancy for the backward kernel (autotune is
+        # unsafe with atomic_add accumulators — see kernel comment).
+        BLOCK_D = 128 if D >= 128 else _next_pow2(max(D, 16))
+
+        _fused_mhc_wc_bwd1_kernel[(T,)](
+            X_flat, perms_flat.reshape(-1),
+            alpha_pre_f, res_coeff_f, beta_f,
+            wc_pre, wc_res, dc_scratch,
+            grad_branch, grad_res, grad_beta,
+            d_wc, d_dc, d_X_partial,
+            d_static_alpha_acc, d_static_beta_acc,
+            d_pbs_acc, d_rs_acc, d_hps_acc,
+            pbs_f, rs_f, hps_f,
+            T=T, n=n, D=D, n_perms=n_perms, n_alpha=n_alpha,
+            N_PERMS_PAD=N_PERMS_PAD,
+            BLOCK_D=BLOCK_D,
+            num_warps=4, num_stages=2,
+        )
+
+        # ------------------------------------------------------------------
+        # GEMMs via cuBLAS:
+        #   normed = F.normalize(X) * sqrt(nD) * (gamma + 1)
+        #   d_W_alpha = normed.T @ d_wc
+        #   d_W_beta  = normed.T @ d_dc
+        #   d_normed  = d_wc @ W_alpha.T + d_dc @ W_beta.T
+        # ------------------------------------------------------------------
+        X_nd = X_flat.reshape(T, nD)
+        X_f32 = X_nd.to(torch.float32)
+        # Match forward's `rms_scale = rsqrt(mean(x^2) + 1e-12)`.
+        inv_rms = torch.rsqrt(X_f32.pow(2).mean(dim=-1, keepdim=True) + 1e-12)  # [T, 1] fp32
+        gamma_p1 = (gamma.to(torch.float32) + 1.0)                              # [nD] fp32
+        normed = (X_f32 * inv_rms * gamma_p1[None, :]).to(W_alpha.dtype)        # [T, nD]
+
+        # Cast d_wc / d_dc to weight dtype for matmul.
+        d_wc_w = d_wc.to(W_alpha.dtype)
+        d_dc_w = d_dc.to(W_beta.dtype)
+
+        d_W_alpha = normed.transpose(0, 1) @ d_wc_w                             # [nD, n_alpha]
+        d_W_beta = normed.transpose(0, 1) @ d_dc_w                              # [nD, n]
+
+        d_normed = d_wc_w @ W_alpha.transpose(0, 1) + d_dc_w @ W_beta.transpose(0, 1)  # [T, nD]
+        d_normed = d_normed.contiguous()
+
+        # ------------------------------------------------------------------
+        # d_gamma computed via chunked PyTorch reduction (avoids atomic add).
+        #   d_gamma[i] = sum_t(d_normed[t, i] * x[t, i] * inv_rms[t])
+        # ------------------------------------------------------------------
+        CHUNK_T = min(T, 1024)
+        d_gamma_f = torch.zeros(nD, dtype=torch.float32, device=device)
+        for t_start in range(0, T, CHUNK_T):
+            t_end = min(t_start + CHUNK_T, T)
+            dn_c = d_normed[t_start:t_end].to(torch.float32)
+            x_c = X_nd[t_start:t_end].to(torch.float32)
+            iv_c = inv_rms[t_start:t_end]
+            d_gamma_f += (dn_c * x_c * iv_c).sum(dim=0)
+        d_gamma = d_gamma_f.to(gamma.dtype)
+
+        # ------------------------------------------------------------------
+        # Pass-B2: RMSNorm backward + d_X_partial combine → d_X [T, n, D]
+        # ------------------------------------------------------------------
+        d_X = torch.empty((T, n, D), dtype=X_flat.dtype, device=device)
+        d_X_partial_nd = d_X_partial.reshape(T, nD).contiguous()
+        d_X_nd = d_X.reshape(T, nD)
+
+        _fused_mhc_wc_bwd2_kernel[(T,)](
+            X_nd.contiguous(),
+            gamma,
+            d_normed,
+            d_X_partial_nd,
+            inv_rms.reshape(T).contiguous(),
+            d_X_nd,
+            T=T, nD=nD,
+        )
+
+        # ------------------------------------------------------------------
+        # Finalize scalar / bias gradients (cast accumulators to param dtype).
+        # ------------------------------------------------------------------
+        d_static_alpha = d_static_alpha_acc.to(static_alpha.dtype)
+        d_static_beta = d_static_beta_acc.to(static_beta.dtype)
+        d_pbs = d_pbs_acc.to(pre_branch_scale.dtype).reshape(pre_branch_scale.shape)
+        d_rs = d_rs_acc.to(residual_scale.dtype).reshape(residual_scale.shape)
+        d_hps = d_hps_acc.to(h_post_scale.dtype).reshape(h_post_scale.shape)
+
+        return (
+            d_X, d_W_alpha, d_W_beta,
+            d_static_alpha, d_static_beta, d_gamma,
+            None,                # perms_flat — constant
+            d_pbs, d_rs, d_hps,
+            None, None, None, None,   # T, n, D, n_perms
+        )
 
 
 # ---------------------------------------------------------------------------
