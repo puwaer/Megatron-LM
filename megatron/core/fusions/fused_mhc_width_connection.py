@@ -143,7 +143,7 @@ if _TRITON_AVAILABLE:
 
     _MHC_OUTPUT_AUTOTUNE_CONFIGS = [
         triton.Config({'BLOCK_D': bd}, num_warps=nw, num_stages=ns)
-        for bd in (64, 128, 256)
+        for bd in (128, 256, 512, 1024)
         for nw in (4, 8)
         for ns in (2, 3)
     ]
@@ -305,22 +305,21 @@ if _TRITON_AVAILABLE:
         exp_l = tl.exp(logits)
         res_coeff = exp_l / tl.sum(exp_l)                              # [N_PERMS_PAD]
 
-        # ---- Precompute h_rows: one [n] weight-vector per output stream ----
-        # Tritonのリスト制約を回避するため、n=4 を前提に手動でアンロールして展開
+        # ---- Precompute h_rows [n, n]: one [n] weight-vector per output stream ----
+        # 3D load of all permutations + reduce over perm index in one shot.
         rows_p = tl.arange(0, N_PERMS_PAD)
-        cols_n = tl.arange(0, n)
-        
-        p0 = tl.load(perms_ptr + rows_p[:, None] * (n * n) + 0 * n + cols_n[None, :], mask=rows_p[:, None] < n_perms, other=0.0).to(tl.float32)
-        h_row_0 = tl.sum(res_coeff[:, None] * p0, axis=0)
-        
-        p1 = tl.load(perms_ptr + rows_p[:, None] * (n * n) + 1 * n + cols_n[None, :], mask=rows_p[:, None] < n_perms, other=0.0).to(tl.float32)
-        h_row_1 = tl.sum(res_coeff[:, None] * p1, axis=0)
-        
-        p2 = tl.load(perms_ptr + rows_p[:, None] * (n * n) + 2 * n + cols_n[None, :], mask=rows_p[:, None] < n_perms, other=0.0).to(tl.float32)
-        h_row_2 = tl.sum(res_coeff[:, None] * p2, axis=0)
-        
-        p3 = tl.load(perms_ptr + rows_p[:, None] * (n * n) + 3 * n + cols_n[None, :], mask=rows_p[:, None] < n_perms, other=0.0).to(tl.float32)
-        h_row_3 = tl.sum(res_coeff[:, None] * p3, axis=0)
+        i_idx = tl.arange(0, n)
+        j_idx = tl.arange(0, n)
+
+        p_all = tl.load(
+            perms_ptr
+            + rows_p[:, None, None] * (n * n)
+            + i_idx[None, :, None] * n
+            + j_idx[None, None, :],
+            mask=(rows_p < n_perms)[:, None, None],
+            other=0.0,
+        ).to(tl.float32)                                                   # [N_PERMS_PAD, n, n]
+        h_rows = tl.sum(res_coeff[:, None, None] * p_all, axis=0)          # [n, n]
 
         # ---- beta [n] = sigmoid(scale * dc + static_beta) * 2 ----
         sb = tl.load(static_beta_ptr + tl.arange(0, n_beta)).to(tl.float32)
@@ -346,19 +345,20 @@ if _TRITON_AVAILABLE:
             tl.store(branch_input_ptr + token_id * D + d_offs,
                      bi.to(tl.bfloat16), mask=d_mask)
 
-            # new_residuals[i, d] = Σ_j h_rows_i[j] * x_chunk[j, d]
-            # こちらもリストを使わず個別のテンソルで計算
-            nr_0 = tl.sum(h_row_0[:, None] * x_chunk, axis=0)
-            nr_1 = tl.sum(h_row_1[:, None] * x_chunk, axis=0)
-            nr_2 = tl.sum(h_row_2[:, None] * x_chunk, axis=0)
-            nr_3 = tl.sum(h_row_3[:, None] * x_chunk, axis=0)
+            # new_residuals[i, d] = Σ_j h_rows[i, j] * x_chunk[j, d]
+            # h_rows [n, n] ⊗ x_chunk [n, BLOCK_D] → nr_all [n, BLOCK_D]
+            nr_all = tl.sum(
+                h_rows[:, :, None] * x_chunk[None, :, :], axis=1,
+            )                                                               # [n, BLOCK_D]
 
-            # メモリへの書き込み
-            out_ptr_base = new_residuals_ptr + token_id * n * D + d_offs
-            tl.store(out_ptr_base + 0 * D, nr_0.to(tl.bfloat16), mask=d_mask)
-            tl.store(out_ptr_base + 1 * D, nr_1.to(tl.bfloat16), mask=d_mask)
-            tl.store(out_ptr_base + 2 * D, nr_2.to(tl.bfloat16), mask=d_mask)
-            tl.store(out_ptr_base + 3 * D, nr_3.to(tl.bfloat16), mask=d_mask)
+            # Single 2D store covering all n streams.
+            nr_ptrs = (
+                new_residuals_ptr
+                + token_id * n * D
+                + n_idx[:, None] * D
+                + d_offs[None, :]
+            )
+            tl.store(nr_ptrs, nr_all.to(tl.bfloat16), mask=d_mask[None, :])
 
     # -----------------------------------------------------------------------
     # Depth connection kernels:
