@@ -43,6 +43,8 @@ except ImportError:
     chunk_gated_delta_rule = None
     fused_recurrent_gated_delta_rule = None
 
+from megatron.core.fusions.fused_gdn_decay import fused_gdn_decay
+
 _FAST_PATH = all(
     [causal_conv1d_fn, causal_conv1d_update, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule]
 )
@@ -423,7 +425,9 @@ class SusonoGatedDeltaNet(nn.Module):
 
         # Beta and decay (g)
         beta = b.sigmoid()
-        g = (-self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())).to(a.dtype)
+        # Fused: g = (-exp(A_log)) * softplus(a + dt_bias), internal fp32.
+        # Replaces a 6-kernel elementwise chain.
+        g = fused_gdn_decay(a, self.A_log, self.dt_bias)
 
         # Expand Q/K if num_v_heads > num_k_heads (grouped)
         ratio = self.num_v_heads // self.num_k_heads

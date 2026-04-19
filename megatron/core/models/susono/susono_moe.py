@@ -67,6 +67,7 @@ except ImportError:
     _HAVE_LIGER_SWIGLU = False
 
 from megatron.core.fusions.fused_bias_swiglu import SwiGLUFunction, swiglu
+from megatron.core.fusions.fused_sigmoid_mul import fused_sigmoid_mul
 
 
 def _fused_silu_mul(gate: Tensor, up: Tensor) -> Tensor:
@@ -757,9 +758,11 @@ class SusonoSparseMoE(nn.Module):
         x = hidden_states.reshape(-1, D)                   # [T, D]
 
         # Shared expert (always active, sigmoid-gated)
-        shared_out  = self.shared_expert(x)                # [T, D]
-        shared_gate = torch.sigmoid(self.shared_expert_gate(x))  # [T, 1]
-        shared_out  = shared_gate * shared_out
+        shared_out  = self.shared_expert(x)                     # [T, D]
+        # Fused sigmoid + broadcast-mul: [T, 1] gate × [T, D] value → [T, D]
+        shared_out  = fused_sigmoid_mul(
+            self.shared_expert_gate(x), shared_out,
+        )
 
         # Routed experts
         router_logits, routing_weights, selected_experts = self.gate(x)

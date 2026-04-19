@@ -51,6 +51,8 @@ except ImportError:
     fused_engram_hash_gather_headproj = None
     _ENGRAM_HAVE_TRITON = False
 
+from megatron.core.fusions.fused_sigmoid_mul import fused_sigmoid_mul
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -509,9 +511,8 @@ class EngramModule(nn.Module):
         # 5. Short convolution (local sequence fusion)
         emb = self.short_conv(emb)           # [B, S, n_embed]
 
-        # 6. Context-aware gating
-        gate = torch.sigmoid(self.gate_proj(hidden_bsf))  # [B, S, n_embed]
-        emb = gate * emb                                   # [B, S, n_embed]
+        # 6. Context-aware gating (fused sigmoid + mul)
+        emb = fused_sigmoid_mul(self.gate_proj(hidden_bsf), emb)
 
         # 7. Project to hidden size
         out = self.out_proj(emb)             # [B, S, D]
