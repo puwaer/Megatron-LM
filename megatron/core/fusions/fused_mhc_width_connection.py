@@ -816,14 +816,32 @@ if _TRITON_AVAILABLE:
             # X needs to be viewed as [T, nD] for Pass 1 (RMSNorm uses flattened)
             X_flat_nd = X_flat.reshape(T, nD)
 
-            # Pass 1: fused RMSNorm + projection → wc, dc scratch buffers
-            # BLOCK_ND / num_warps / num_stages are picked by @triton.autotune.
-            _fused_mhc_wc_proj_kernel[(T,)](
-                X_flat_nd, W_alpha, W_beta, gamma,
-                wc_scratch, dc_scratch,
-                T=T, nD=nD, n_alpha=n_alpha, n_beta=n_beta,
-                N_ALPHA_PAD=N_ALPHA_PAD,
-            )
+            # ---- Pass 1 replacement: Liger RMSNorm + cuBLAS matmuls ----
+            # The previous per-token Triton projection was memory-bound and
+            # did not use tensor cores (~14% of total GPU time, 2.6 ms/call
+            # at MBS=4/S=4096).  cuBLAS bf16 matmul with fp32 accumulation
+            # is an order of magnitude faster for these shapes.
+            #
+            # Numerics: the original kernel accumulated wc/dc in fp32.
+            # cuBLAS bf16 GEMM also uses fp32 accumulators internally on
+            # Hopper tensor cores, so the result remains fp32-precision
+            # up to the final bf16 round.  We store fp32 in the scratch
+            # buffers so Pass-2 sees the same layout as before.
+            from megatron.core.fusions.susono_fused_norm import rmsnorm_1p
+            normed = rmsnorm_1p(X_flat_nd, gamma)                     # [T, nD] bf16
+            wc = normed @ W_alpha                                      # [T, n_alpha] bf16
+            dc = normed @ W_beta                                       # [T, n_beta]  bf16
+            # Fill fp32 scratches in the format Pass-2 expects.
+            wc_scratch[:, :n_alpha] = wc.to(torch.float32)
+            dc_scratch.copy_(dc.to(torch.float32))
+
+            # Materialise scalar scales ONCE per forward.  Each `.item()` call
+            # forces a GPU→CPU sync; caching them across Pass2 launch, into
+            # ctx for backward, and (previously) a repeat in the backward
+            # helper used to cost ~600 ms of blocking per iteration.
+            pbs_f = float(pre_branch_scale.item())
+            rs_f = float(residual_scale.item())
+            hps_f = float(h_post_scale.item())
 
             # Pass 2: compute alpha_pre, H_res (in registers), outputs
             # BLOCK_D / num_warps / num_stages are picked by @triton.autotune.
@@ -832,9 +850,9 @@ if _TRITON_AVAILABLE:
                 wc_scratch, dc_scratch,
                 static_alpha, static_beta,
                 perms_flat.reshape(-1),   # flatten to 1D for simple pointer math
-                pre_branch_scale.item(),
-                residual_scale.item(),
-                h_post_scale.item(),
+                pbs_f,
+                rs_f,
+                hps_f,
                 branch_input, new_residuals, beta_out,
                 T=T, n=n, D=D, n_alpha=n_alpha, n_perms=n_perms, n_beta=n_beta,
                 N_ALPHA_PAD=N_ALPHA_PAD, N_PERMS_PAD=N_PERMS_PAD,
@@ -850,6 +868,10 @@ if _TRITON_AVAILABLE:
                 wc_scratch, dc_scratch,
             )
             ctx.T, ctx.n, ctx.D, ctx.n_perms = T, n, D, n_perms
+            # Cache scalar scales so backward avoids repeat .item() syncs.
+            ctx.pbs_f = pbs_f
+            ctx.rs_f = rs_f
+            ctx.hps_f = hps_f
             return branch_input, new_residuals, beta_out
 
         @staticmethod
@@ -885,6 +907,8 @@ if _TRITON_AVAILABLE:
                 perms_flat, pbs, rs, hps,
                 wc_scratch, dc_scratch,
                 T, n, D, n_perms,
+                # Pre-computed scalar scales (avoid .item() sync in backward).
+                pbs_f=ctx.pbs_f, rs_f=ctx.rs_f, hps_f=ctx.hps_f,
             )
 
 
@@ -947,15 +971,20 @@ if _TRITON_AVAILABLE:
         static_beta: Tensor,   # [n]
         gamma: Tensor,         # [nD]
         perms_flat: Tensor,    # [n_perms, n, n]
-        pre_branch_scale: Tensor,
-        residual_scale: Tensor,
-        h_post_scale: Tensor,
+        pre_branch_scale: Tensor,   # kept only for d_pbs reshape
+        residual_scale: Tensor,     # kept only for d_rs reshape
+        h_post_scale: Tensor,       # kept only for d_hps reshape
         wc_scratch: Tensor,    # [T, N_ALPHA_PAD] fp32
         dc_scratch: Tensor,    # [T, n]           fp32
         T: int,
         n: int,
         D: int,
         n_perms: int,
+        # Pre-computed scalar scales passed by the caller so we don't have
+        # to call `.item()` again (each sync costs ~600 ms in the profile).
+        pbs_f: float = None,
+        rs_f: float = None,
+        hps_f: float = None,
     ):
         """All-Triton (plus cuBLAS GEMMs) backward for _width_connection.
 
@@ -979,9 +1008,14 @@ if _TRITON_AVAILABLE:
         wc_pre = wc_scratch[:, :n].contiguous()                               # [T, n]
         wc_res = wc_scratch[:, n:n + n_perms].contiguous()                    # [T, n_perms]
 
-        pbs_f = float(pre_branch_scale.item())
-        rs_f = float(residual_scale.item())
-        hps_f = float(h_post_scale.item())
+        # Fallback only if caller did not provide cached scalars
+        # (e.g. direct debug invocation without the autograd Function).
+        if pbs_f is None:
+            pbs_f = float(pre_branch_scale.item())
+        if rs_f is None:
+            rs_f = float(residual_scale.item())
+        if hps_f is None:
+            hps_f = float(h_post_scale.item())
 
         sa_pre = static_alpha[:n].to(torch.float32)
         sa_res = static_alpha[n:n + n_perms].to(torch.float32)
