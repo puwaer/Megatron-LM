@@ -499,12 +499,13 @@ if _TRITON_AVAILABLE:
         for ns in (2, 3)
     ]
 
-    # NOTE: no @triton.autotune on the backward kernel.  The atomic_add
-    # accumulators cannot safely tolerate repeated kernel invocations
-    # during autotune benchmarking (side effects accumulate across runs,
-    # and reset_to_zero isn't fully effective with Triton 3.6 for our
-    # layout).  Use a fixed BLOCK_D / num_warps / num_stages instead and
-    # rely on the cache hit for subsequent runs.
+    # With atomic_add replaced by per-token scratch writes + post-kernel
+    # torch.sum reduction, autotune is safe to enable (no accumulating side
+    # effects across benchmark repetitions).
+    @triton.autotune(
+        configs=_MHC_BWD1_AUTOTUNE_CONFIGS,
+        key=['D', 'n', 'n_perms', 'N_PERMS_PAD'],
+    )
     @triton.jit
     def _fused_mhc_wc_bwd1_kernel(
         # Inputs
@@ -523,12 +524,14 @@ if _TRITON_AVAILABLE:
         d_wc_ptr,             # [T, n_alpha]    fp32  (wc_pre | wc_res layout)
         d_dc_ptr,             # [T, n]          fp32
         d_X_partial_ptr,      # [T, n, D]       bf16
-        # Atomic accumulators (fp32)
-        d_static_alpha_acc_ptr,   # [n_alpha]
-        d_static_beta_acc_ptr,    # [n]
-        d_pbs_acc_ptr,            # [1]
-        d_rs_acc_ptr,             # [1]
-        d_hps_acc_ptr,            # [1]
+        # Per-token contribution buffers (fp32); summed on axis 0 by the
+        # driver after the kernel returns.  Replaces the previous atomic_add
+        # accumulators which serialised 32 k tokens onto tiny buffers.
+        d_static_alpha_contrib_ptr,   # [T, n_alpha]
+        d_static_beta_contrib_ptr,    # [T, n]
+        d_pbs_contrib_ptr,            # [T]
+        d_rs_contrib_ptr,             # [T]
+        d_hps_contrib_ptr,            # [T]
         # Scalar scales as 1-element tensors (loaded once per program to avoid
         # CPU↔GPU sync that `.item()` would incur).
         pre_branch_scale_ptr,
@@ -585,10 +588,10 @@ if _TRITON_AVAILABLE:
         d_dc = d_logit_beta * h_post_scale                                    # [n]
         tl.store(d_dc_ptr + t * n + cols_n, d_dc)
 
-        # d_static_beta accumulates d_logit_beta per element
-        tl.atomic_add(d_static_beta_acc_ptr + cols_n, d_logit_beta)
-        # d_hps accumulates sum over n of d_logit_beta * dc
-        tl.atomic_add(d_hps_acc_ptr, tl.sum(d_logit_beta * dc))
+        # Per-token contributions (reduction-tree pattern).  The driver will
+        # call ``tensor.sum(dim=0)`` after the kernel returns.
+        tl.store(d_static_beta_contrib_ptr + t * n + cols_n, d_logit_beta)
+        tl.store(d_hps_contrib_ptr + t, tl.sum(d_logit_beta * dc))
 
         # ---- Build H_res [n, n] from res_coeff and perms ----
         #   H_res[i, j] = sum_r(res_coeff[r] * perms[r, i, j])
@@ -680,16 +683,18 @@ if _TRITON_AVAILABLE:
         # Clamp res_idx to 0 for masked lanes (first element is a safe target).
         safe_res_idx = tl.where(res_mask, res_idx, 0)
 
-        # Atomic reductions for static_alpha
-        tl.atomic_add(d_static_alpha_acc_ptr + cols_n, d_logit_pre)
-        tl.atomic_add(
-            d_static_alpha_acc_ptr + n + safe_res_idx,
+        # Per-token contributions for static_alpha (stored into the [T, n_alpha]
+        # buffer in the same wc_pre | wc_res layout used by ``d_wc``).  The
+        # driver reduces on axis 0 with torch.sum.
+        tl.store(d_static_alpha_contrib_ptr + t * n_alpha + cols_n, d_logit_pre)
+        tl.store(
+            d_static_alpha_contrib_ptr + t * n_alpha + n + safe_res_idx,
             d_logit_res_safe,
         )
 
-        # Atomic reductions for pbs, rs scalars (no mask needed — zeroed lanes)
-        tl.atomic_add(d_pbs_acc_ptr, tl.sum(d_logit_pre * wc_pre))
-        tl.atomic_add(d_rs_acc_ptr, tl.sum(d_logit_res_safe * wc_res))
+        # Per-token contributions for the scalar params (pbs, rs).
+        tl.store(d_pbs_contrib_ptr + t, tl.sum(d_logit_pre * wc_pre))
+        tl.store(d_rs_contrib_ptr + t, tl.sum(d_logit_res_safe * wc_res))
 
         # ---- Store d_wc = [d_wc_pre | d_wc_res] in [T, n_alpha] layout ----
         tl.store(d_wc_ptr + t * n_alpha + cols_n, d_wc_pre)
@@ -1027,16 +1032,20 @@ if _TRITON_AVAILABLE:
         d_dc = torch.empty((T, n), dtype=torch.float32, device=device)
         d_X_partial = torch.empty((T, n, D), dtype=X_flat.dtype, device=device)
 
-        d_static_alpha_acc = torch.zeros(n_alpha, dtype=torch.float32, device=device)
-        d_static_beta_acc = torch.zeros(n, dtype=torch.float32, device=device)
-        d_pbs_acc = torch.zeros(1, dtype=torch.float32, device=device)
-        d_rs_acc = torch.zeros(1, dtype=torch.float32, device=device)
-        d_hps_acc = torch.zeros(1, dtype=torch.float32, device=device)
+        # Per-token contribution buffers — reduced on axis 0 after the kernel.
+        # Uses ``zeros`` rather than ``empty`` so masked-lane writes (e.g., the
+        # padded n_perms range) stay at 0 without leaking stale memory.
+        d_static_alpha_contrib = torch.zeros(
+            (T, n_alpha), dtype=torch.float32, device=device,
+        )
+        d_static_beta_contrib = torch.empty(
+            (T, n), dtype=torch.float32, device=device,
+        )
+        d_pbs_contrib = torch.empty(T, dtype=torch.float32, device=device)
+        d_rs_contrib = torch.empty(T, dtype=torch.float32, device=device)
+        d_hps_contrib = torch.empty(T, dtype=torch.float32, device=device)
 
         N_PERMS_PAD = _next_pow2(n_perms)
-        # Fixed block size / occupancy for the backward kernel (autotune is
-        # unsafe with atomic_add accumulators — see kernel comment).
-        BLOCK_D = 128 if D >= 128 else _next_pow2(max(D, 16))
 
         _fused_mhc_wc_bwd1_kernel[(T,)](
             X_flat, perms_flat.reshape(-1),
@@ -1044,15 +1053,22 @@ if _TRITON_AVAILABLE:
             wc_pre, wc_res, dc_scratch,
             grad_branch, grad_res, grad_beta,
             d_wc, d_dc, d_X_partial,
-            d_static_alpha_acc, d_static_beta_acc,
-            d_pbs_acc, d_rs_acc, d_hps_acc,
+            d_static_alpha_contrib, d_static_beta_contrib,
+            d_pbs_contrib, d_rs_contrib, d_hps_contrib,
             # Pass the scale tensors directly; kernel loads each via tl.load.
             pre_branch_scale, residual_scale, h_post_scale,
             T=T, n=n, D=D, n_perms=n_perms, n_alpha=n_alpha,
             N_PERMS_PAD=N_PERMS_PAD,
-            BLOCK_D=BLOCK_D,
-            num_warps=4, num_stages=2,
         )
+
+        # Reduce per-token contributions with a simple fp32 sum — much cheaper
+        # than 32 k × 5 atomic adds, and autotune-safe (no accumulating side
+        # effects across kernel replays during benchmarking).
+        d_static_alpha_acc = d_static_alpha_contrib.sum(dim=0)     # [n_alpha]
+        d_static_beta_acc = d_static_beta_contrib.sum(dim=0)        # [n]
+        d_pbs_acc = d_pbs_contrib.sum(dim=0, keepdim=True)          # [1]
+        d_rs_acc = d_rs_contrib.sum(dim=0, keepdim=True)            # [1]
+        d_hps_acc = d_hps_contrib.sum(dim=0, keepdim=True)          # [1]
 
         # ------------------------------------------------------------------
         # GEMMs via cuBLAS:
