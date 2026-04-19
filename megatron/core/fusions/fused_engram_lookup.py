@@ -300,3 +300,190 @@ def _fallback_hash_and_gather(
     indices = torch.cat(all_indices, dim=-1)  # [B, S, total_heads]
     emb = torch.nn.functional.embedding(indices, table_weight)  # [B, S, th, E]
     return emb.reshape(B, S, total_heads * E)
+
+
+# ---------------------------------------------------------------------------
+# Approach B: fuse hash + gather + head_proj into a single autograd.Function
+# so that the huge [B, S, total_heads * E] ``emb_flat`` is NOT saved for
+# backward.  Backward recomputes it from ``indices`` via F.embedding (a
+# cheap gather) just before the head_proj backward.  This trades a small
+# transient re-gather for ~352 MB saved_for_backward per Engram layer.
+# ---------------------------------------------------------------------------
+
+
+def _triton_hash_gather_with_indices(
+    compressed_ids: Tensor,
+    table_weight: Tensor,
+    multipliers: Tensor,
+    primes: Tensor,
+    head_base: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """Like ``fused_engram_hash_and_gather`` but also returns the indices
+    tensor alongside the flat embedding.  Non-differentiable wrapper.
+    """
+    assert _HAVE_TRITON, "Triton is required"
+    assert compressed_ids.is_cuda and table_weight.is_cuda
+
+    B, S = compressed_ids.shape
+    num_orders, H_per_order, MAX_K = multipliers.shape
+    total_heads = num_orders * H_per_order
+    total_rows, E = table_weight.shape
+
+    device = compressed_ids.device
+    indices = torch.empty(
+        (B, S, total_heads), dtype=torch.int64, device=device
+    )
+    out_flat = torch.empty(
+        (B, S, total_heads * E), dtype=table_weight.dtype, device=device
+    )
+
+    compressed_c = compressed_ids.contiguous()
+    table_c = table_weight.contiguous()
+    mults_c = multipliers.contiguous()
+    primes_c = primes.contiguous()
+    head_base_c = head_base.contiguous()
+
+    BLOCK_E = 128 if E >= 128 else triton.next_power_of_2(E)
+
+    grid = (B * S, total_heads)
+    _fused_engram_hash_gather_kernel[grid](
+        compressed_c, table_c, mults_c, primes_c, head_base_c,
+        indices, out_flat,
+        B, S,
+        NUM_ORDERS=num_orders,
+        H_PER_ORDER=H_per_order,
+        MAX_K=MAX_K,
+        E=E,
+        BLOCK_E=BLOCK_E,
+    )
+    return indices, out_flat
+
+
+class FusedEngramHashGatherHeadProj(torch.autograd.Function):
+    """Fused hash + gather + head_proj.
+
+    Forward:
+        out[b, s, j] = sum_{h, k}(
+            table[hash_h(b, s), k] * head_proj_w[j, h * E + k]
+        )
+        shape: [B, S, out_dim]   (out_dim == head_proj output = n_embed_dim)
+
+    Implemented as:
+        indices, emb_flat = fused_engram_hash_and_gather(...)
+                                                # emb_flat: [B, S, total_heads * E]
+        out = emb_flat @ head_proj_w.T          # cuBLAS matmul
+
+    ``emb_flat`` is NOT saved for backward.  ``indices`` is saved instead
+    (small int64 tensor, ~16 MB for MBS=4/S=4096/total_heads=16).  In
+    backward, emb_flat is re-gathered via F.embedding, then head_proj
+    and scatter-add(d_table) backward proceed normally.
+
+    Returned gradients: (None, d_table, d_head_proj_w, None, None, None)
+    The non-differentiable inputs (compressed_ids, multipliers, primes,
+    head_base) receive None gradients.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        compressed_ids: Tensor,     # [B, S] int64
+        table_weight: Tensor,        # [total_rows, E] bf16
+        head_proj_weight: Tensor,    # [out_dim, total_heads * E] bf16
+        multipliers: Tensor,         # [NUM_ORDERS, H, MAX_K] int64
+        primes: Tensor,              # [NUM_ORDERS] int64
+        head_base: Tensor,           # [NUM_ORDERS * H] int64
+    ) -> Tensor:
+        if not (_HAVE_TRITON and compressed_ids.is_cuda and table_weight.is_cuda):
+            raise RuntimeError(
+                "FusedEngramHashGatherHeadProj requires CUDA + Triton; "
+                "callers should route through "
+                "fused_engram_hash_gather_headproj() which has a fallback."
+            )
+
+        indices, emb_flat = _triton_hash_gather_with_indices(
+            compressed_ids, table_weight,
+            multipliers, primes, head_base,
+        )
+        # emb_flat: [B, S, total_heads * E]
+        # head_proj_weight: [out_dim, total_heads * E]
+        # out: [B, S, out_dim]
+        out = emb_flat @ head_proj_weight.t()
+
+        # Save only the small index tensor + params.  The 352 MB emb_flat
+        # goes out of scope when this function returns.
+        ctx.save_for_backward(indices, table_weight, head_proj_weight)
+        ctx.table_shape = table_weight.shape
+        ctx.B = compressed_ids.shape[0]
+        ctx.S = compressed_ids.shape[1]
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        indices, table_weight, head_proj_weight = ctx.saved_tensors
+        total_rows, E = ctx.table_shape
+        B, S = ctx.B, ctx.S
+        total_heads = indices.shape[-1]
+
+        # grad_out: [B, S, out_dim]
+        # head_proj_weight: [out_dim, total_heads * E]
+
+        # Step 1: recompute emb_flat via F.embedding gather (352 MB transient).
+        emb_flat = torch.nn.functional.embedding(
+            indices, table_weight,
+        ).reshape(B, S, total_heads * E)
+
+        # Step 2: head_proj backward.
+        # d_emb_flat = grad_out @ head_proj_weight   # [B, S, total_heads * E]
+        d_emb_flat = grad_out @ head_proj_weight
+
+        # d_head_proj_weight = grad_out.T @ emb_flat (flattened over B*S)
+        # grad_out: [B*S, out_dim], emb_flat: [B*S, total_heads * E]
+        go_flat = grad_out.reshape(-1, grad_out.shape[-1])
+        em_flat = emb_flat.reshape(-1, total_heads * E)
+        d_head_proj_weight = go_flat.t() @ em_flat
+
+        # Step 3: d_table via scatter_add (same pattern as F.embedding backward).
+        d_table = torch.zeros(
+            (total_rows, E),
+            dtype=grad_out.dtype,
+            device=grad_out.device,
+        )
+        d_emb_rows = d_emb_flat.reshape(-1, E)
+        flat_indices = indices.reshape(-1)
+        d_table.index_add_(0, flat_indices, d_emb_rows)
+
+        return (
+            None,               # compressed_ids
+            d_table,            # table_weight
+            d_head_proj_weight, # head_proj_weight
+            None,               # multipliers
+            None,               # primes
+            None,               # head_base
+        )
+
+
+def fused_engram_hash_gather_headproj(
+    compressed_ids: Tensor,
+    table_weight: Tensor,
+    head_proj_weight: Tensor,
+    multipliers: Tensor,
+    primes: Tensor,
+    head_base: Tensor,
+) -> Tensor:
+    """Run Approach-B fused kernel when possible; otherwise fall back to the
+    split path (fused_engram_hash_and_gather → matmul).
+
+    The fallback still benefits from the hash+gather fusion but loses the
+    saved_for_backward memory reduction that Approach B provides.
+    """
+    if _HAVE_TRITON and compressed_ids.is_cuda and table_weight.is_cuda:
+        return FusedEngramHashGatherHeadProj.apply(
+            compressed_ids, table_weight, head_proj_weight,
+            multipliers, primes, head_base,
+        )
+    # Pure-PyTorch fallback: hash+gather+matmul without the save_for_backward
+    # optimisation.
+    emb_flat = _fallback_hash_and_gather(
+        compressed_ids, table_weight, multipliers, primes, head_base,
+    )
+    return emb_flat @ head_proj_weight.t()

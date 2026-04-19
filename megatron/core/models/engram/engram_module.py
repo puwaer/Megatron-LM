@@ -43,10 +43,12 @@ except ImportError:
 try:
     from megatron.core.fusions.fused_engram_lookup import (
         fused_engram_hash_and_gather,
+        fused_engram_hash_gather_headproj,
         _HAVE_TRITON as _ENGRAM_HAVE_TRITON,
     )
 except ImportError:
     fused_engram_hash_and_gather = None
+    fused_engram_hash_gather_headproj = None
     _ENGRAM_HAVE_TRITON = False
 
 
@@ -473,28 +475,36 @@ class EngramModule(nn.Module):
         # 1. Compress vocabulary
         compressed = self.tokenizer(input_ids)  # [B, S]
 
-        # 2–4. Fused hash + gather → flat [B, S, total_heads * n_embed].
-        #      Falls back to the original 3-step PyTorch path when Triton
-        #      is unavailable or inputs are on CPU.
-        use_fused = (
+        # 2–5. Fused hash + gather + head_proj (Approach B).
+        #      The full path including the head_proj matmul is wrapped in
+        #      a single autograd.Function so that emb_flat ([B, S,
+        #      total_heads * n_embed] ~ 352 MB per layer at MBS=4/S=4096)
+        #      is NOT persisted to save_for_backward.  backward regenerates
+        #      it from the saved ``indices`` tensor via F.embedding.
+        #
+        #      Falls back gracefully when Triton / CUDA is unavailable.
+        use_fused_headproj = (
             _ENGRAM_HAVE_TRITON
-            and fused_engram_hash_and_gather is not None
+            and fused_engram_hash_gather_headproj is not None
             and compressed.is_cuda
             and self.multi_head_emb.table.weight.is_cuda
         )
-        if use_fused:
-            emb_flat = fused_engram_hash_and_gather(
+        if use_fused_headproj:
+            emb = fused_engram_hash_gather_headproj(
                 compressed,
                 self.multi_head_emb.table.weight,
+                self.head_proj.weight,
                 self.ngram_hash.multipliers,
                 self.ngram_hash.primes_tensor,
                 self.ngram_hash.head_base_flat,
-            )                                    # [B, S, total_heads * n_embed]
+            )                                     # [B, S, n_embed]
         else:
+            # Pure-PyTorch fallback: replicate the original 3-step gather
+            # then apply head_proj as an nn.Linear.
             indices = self.ngram_hash(compressed)        # [B, S, total_heads]
-            emb = self.multi_head_emb(indices)            # [B, S, total_heads, n_embed]
-            emb_flat = emb.view(B, S, -1)                  # [B, S, total_heads * n_embed]
-        emb = self.head_proj(emb_flat)                      # [B, S, n_embed]
+            emb_bf = self.multi_head_emb(indices)         # [B, S, total_heads, n_embed]
+            emb_flat = emb_bf.view(B, S, -1)               # [B, S, total_heads * n_embed]
+            emb = self.head_proj(emb_flat)                  # [B, S, n_embed]
 
         # 5. Short convolution (local sequence fusion)
         emb = self.short_conv(emb)           # [B, S, n_embed]
