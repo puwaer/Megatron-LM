@@ -705,10 +705,61 @@ if _TRITON_AVAILABLE:
 
     _MHC_BWD2_AUTOTUNE_CONFIGS = [
         triton.Config({'BLOCK_ND': bn}, num_warps=nw, num_stages=ns)
-        for bn in (64, 128, 256, 512)
+        for bn in (128, 256, 512, 1024, 2048)
         for nw in (4, 8)
         for ns in (2, 3)
     ]
+
+    _MHC_D_GAMMA_AUTOTUNE_CONFIGS = [
+        triton.Config({'BLOCK_ND': bnd, 'BLOCK_T': bt}, num_warps=nw, num_stages=ns)
+        for bnd in (64, 128, 256)
+        for bt in (32, 64, 128)
+        for nw in (4, 8)
+        for ns in (2, 3)
+    ]
+
+    @triton.autotune(
+        configs=_MHC_D_GAMMA_AUTOTUNE_CONFIGS,
+        key=['nD'],
+    )
+    @triton.jit
+    def _mhc_d_gamma_kernel(
+        d_normed_ptr,   # [T, nD]   bf16
+        X_ptr,          # [T, nD]   bf16
+        inv_rms_ptr,    # [T]       fp32
+        d_gamma_ptr,    # [nD]      fp32
+        T,
+        nD: tl.constexpr,
+        BLOCK_ND: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+    ):
+        """Compute ``d_gamma[i] = sum_t(d_normed[t, i] * x[t, i] * inv_rms[t])``.
+
+        Replaces a 32-iteration Python chunked loop (~130 kernel launches with
+        per-iteration cast / mul / sum / add) with a single Triton launch.
+        """
+        pid = tl.program_id(0)
+        col_offs = pid * BLOCK_ND + tl.arange(0, BLOCK_ND)
+        col_mask = col_offs < nD
+
+        acc = tl.zeros([BLOCK_ND], dtype=tl.float32)
+        for t_start in range(0, T, BLOCK_T):
+            t_offs = t_start + tl.arange(0, BLOCK_T)
+            t_mask = t_offs < T
+
+            iv = tl.load(inv_rms_ptr + t_offs, mask=t_mask, other=0.0).to(tl.float32)
+            dn_ptrs = d_normed_ptr + t_offs[:, None] * nD + col_offs[None, :]
+            dn = tl.load(
+                dn_ptrs, mask=t_mask[:, None] & col_mask[None, :], other=0.0,
+            ).to(tl.float32)
+            x_ptrs = X_ptr + t_offs[:, None] * nD + col_offs[None, :]
+            x = tl.load(
+                x_ptrs, mask=t_mask[:, None] & col_mask[None, :], other=0.0,
+            ).to(tl.float32)
+
+            acc += tl.sum(dn * x * iv[:, None], axis=0)
+
+        tl.store(d_gamma_ptr + col_offs, acc, mask=col_mask)
 
     @triton.autotune(
         configs=_MHC_BWD2_AUTOTUNE_CONFIGS,
@@ -1095,17 +1146,21 @@ if _TRITON_AVAILABLE:
         d_normed = d_normed.contiguous()
 
         # ------------------------------------------------------------------
-        # d_gamma computed via chunked PyTorch reduction (avoids atomic add).
-        #   d_gamma[i] = sum_t(d_normed[t, i] * x[t, i] * inv_rms[t])
+        # d_gamma[i] = sum_t(d_normed[t, i] * x[t, i] * inv_rms[t])
+        # Single-kernel Triton reduction, replaces a 32-iteration Python loop.
         # ------------------------------------------------------------------
-        CHUNK_T = min(T, 1024)
-        d_gamma_f = torch.zeros(nD, dtype=torch.float32, device=device)
-        for t_start in range(0, T, CHUNK_T):
-            t_end = min(t_start + CHUNK_T, T)
-            dn_c = d_normed[t_start:t_end].to(torch.float32)
-            x_c = X_nd[t_start:t_end].to(torch.float32)
-            iv_c = inv_rms[t_start:t_end]
-            d_gamma_f += (dn_c * x_c * iv_c).sum(dim=0)
+        d_gamma_f = torch.empty(nD, dtype=torch.float32, device=device)
+
+        def _d_gamma_grid(meta):
+            return (triton.cdiv(nD, meta['BLOCK_ND']),)
+
+        _mhc_d_gamma_kernel[_d_gamma_grid](
+            d_normed,
+            X_nd.contiguous(),
+            inv_rms.reshape(T).contiguous(),
+            d_gamma_f,
+            T=T, nD=nD,
+        )
         d_gamma = d_gamma_f.to(gamma.dtype)
 
         # ------------------------------------------------------------------
