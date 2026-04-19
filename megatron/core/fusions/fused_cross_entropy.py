@@ -146,3 +146,54 @@ def fused_vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group):
 
     """
     return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, tp_group)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Liger-Kernel cross-entropy adapter (Triton-fused, high-memory-efficiency
+# forward+backward in a single kernel; especially strong at large vocab).
+# Only valid when tensor-parallel size == 1 because Liger expects an un-sharded
+# logits tensor.  Fall back to the in-tree JIT-fused path otherwise.
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from liger_kernel.ops.cross_entropy import LigerCrossEntropyFunction
+    _HAVE_LIGER_CE = True
+except ImportError:
+    LigerCrossEntropyFunction = None
+    _HAVE_LIGER_CE = False
+
+
+def liger_vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group):
+    """Run Liger's fused cross-entropy.
+
+    Requires TP size == 1 (Liger does not split vocab across ranks).  For TP>1
+    callers should select ``cross_entropy_fusion_impl='native'`` or ``'te'``.
+
+    Expected shapes:
+        vocab_parallel_logits: [S, B, V]
+        target:                [S, B]
+    Returns:
+        loss: [S, B]
+    """
+    if not _HAVE_LIGER_CE:
+        raise RuntimeError(
+            "cross_entropy_fusion_impl='liger' selected but liger_kernel is not "
+            "installed in this environment."
+        )
+    if tp_group is not None and tp_group.size() > 1:
+        raise NotImplementedError(
+            "Liger cross-entropy does not support vocab-parallel splits. "
+            "Set cross_entropy_fusion_impl to 'native' or 'te' when using TP>1."
+        )
+    orig_shape = vocab_parallel_logits.shape  # [S, B, V]
+    S, B, V = orig_shape
+    logits_2d = vocab_parallel_logits.reshape(S * B, V)
+    target_1d = target.reshape(S * B)
+    # Liger signature: (input, target, weight=None, ignore_index=-100,
+    #                   lse_square_scale=0.0, label_smoothing=0.0,
+    #                   reduction="none", softcap=None, return_z_loss=False)
+    loss_1d = LigerCrossEntropyFunction.apply(
+        logits_2d, target_1d, None, -100, 0.0, 0.0, "none", None, False,
+    )
+    if isinstance(loss_1d, tuple):
+        loss_1d = loss_1d[0]
+    return loss_1d.reshape(S, B)

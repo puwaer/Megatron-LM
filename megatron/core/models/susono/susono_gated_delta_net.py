@@ -35,6 +35,15 @@ except ImportError:
     causal_conv1d_update = None
 
 try:
+    from megatron.core.extensions.transformer_engine import (
+        TELayerNormColumnParallelLinear,
+    )
+    _HAVE_TE_LNL = True
+except ImportError:
+    TELayerNormColumnParallelLinear = None
+    _HAVE_TE_LNL = False
+
+try:
     from fla.ops.gated_delta_rule import (
         chunk_gated_delta_rule,
         fused_recurrent_gated_delta_rule,
@@ -42,6 +51,8 @@ try:
 except ImportError:
     chunk_gated_delta_rule = None
     fused_recurrent_gated_delta_rule = None
+
+from megatron.core.fusions.fused_gdn_decay import fused_gdn_decay
 
 _FAST_PATH = all(
     [causal_conv1d_fn, causal_conv1d_update, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule]
@@ -215,19 +226,19 @@ def _recurrent_gated_delta_rule(
 # RMSNorm with gating (output norm)
 # ──────────────────────────────────────────────────────────────────────────────
 
+from megatron.core.fusions.susono_fused_norm import rmsnorm_gated
+
+
 class _RMSNormGated(nn.Module):
+    """Output RMSNorm for GatedDeltaNet: standard RMSNorm * SiLU(gate)."""
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
     def forward(self, x: Tensor, gate: Tensor) -> Tensor:
-        dtype = x.dtype
-        x = x.float()
-        var = (x * x).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        x = self.weight * x.to(dtype)
-        return x * F.silu(gate.float()).to(dtype)
+        return rmsnorm_gated(x, self.weight, gate, self.eps)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -250,6 +261,7 @@ class SusonoGatedDeltaNet(nn.Module):
     def __init__(self, config, layer_idx: int) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.config = config
         self.hidden_size = config.hidden_size
 
         # Attention head configuration (reuse linear_* fields from TransformerConfig)
@@ -273,11 +285,42 @@ class SusonoGatedDeltaNet(nn.Module):
             bias=False,
         )
 
-        # Input projections
+        # Input projections.  Fused LayerNorm + (QKVZ + BA) via Megatron's
+        # ``TELayerNormColumnParallelLinear`` wrapper, which handles FP8
+        # ``is_first_microbatch`` tracking and works with Megatron's training
+        # loop reset mechanism.  Replaces the previous external RMSNorm +
+        # two bf16 ``nn.Linear`` projections — the fused kernel both reduces
+        # kernel launches and lets the QKVZ matmul (12288×2048) run in FP8
+        # under ``fp8_autocast``, roughly doubling its GEMM throughput.
         proj_qkvz = self.key_dim * 2 + self.value_dim * 2
         proj_ba   = self.num_v_heads * 2
-        self.in_proj_qkvz = nn.Linear(self.hidden_size, proj_qkvz, bias=False)
-        self.in_proj_ba   = nn.Linear(self.hidden_size, proj_ba,   bias=False)
+        self.proj_qkvz_size = proj_qkvz
+        self.proj_ba_size = proj_ba
+
+        if _HAVE_TE_LNL:
+            from megatron.core.utils import init_method_normal
+
+            init_method = init_method_normal(
+                getattr(config, 'init_method_std', 0.02)
+            )
+            self.input_ln_proj = TELayerNormColumnParallelLinear(
+                input_size=self.hidden_size,
+                output_size=proj_qkvz + proj_ba,
+                config=config,
+                init_method=init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name=None,
+            )
+            self.in_proj_qkvz = None
+            self.in_proj_ba = None
+        else:
+            # Fallback: keep the original separate modules (CPU / no-TE).
+            self.input_ln_proj = None
+            self.in_proj_qkvz = nn.Linear(self.hidden_size, proj_qkvz, bias=False)
+            self.in_proj_ba   = nn.Linear(self.hidden_size, proj_ba,   bias=False)
 
         # Learnable time-step and decay parameters.
         # A ~ U[0.001, 0.016] → per-step g ≈ -0.007, cumsum(64) ≈ -0.45,
@@ -371,9 +414,16 @@ class SusonoGatedDeltaNet(nn.Module):
             and S == 1
         )
 
-        # Project input
-        qkvz = self.in_proj_qkvz(hidden_states)   # [B, S, proj_qkvz]
-        ba   = self.in_proj_ba(hidden_states)      # [B, S, proj_ba]
+        # Project input.  Fused path uses a single TELayerNormColumnParallelLinear
+        # (LayerNorm + concat(QKVZ, BA)) → split afterwards.  Legacy path keeps
+        # the external ``input_layernorm`` + two ``nn.Linear`` modules.
+        if self.input_ln_proj is not None:
+            combined, _bias = self.input_ln_proj(hidden_states)  # [B, S, proj_qkvz+proj_ba]
+            qkvz = combined[..., :self.proj_qkvz_size]
+            ba   = combined[..., self.proj_qkvz_size:]
+        else:
+            qkvz = self.in_proj_qkvz(hidden_states)   # [B, S, proj_qkvz]
+            ba   = self.in_proj_ba(hidden_states)      # [B, S, proj_ba]
         q, k, v, z, b, a = self._split_qkvz_ba(qkvz, ba)
 
         # Flatten Q, K, V to channel dimension for conv1d: [B, S, conv_dim]
@@ -423,7 +473,9 @@ class SusonoGatedDeltaNet(nn.Module):
 
         # Beta and decay (g)
         beta = b.sigmoid()
-        g = (-self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())).to(a.dtype)
+        # Fused: g = (-exp(A_log)) * softplus(a + dt_bias), internal fp32.
+        # Replaces a 6-kernel elementwise chain.
+        g = fused_gdn_decay(a, self.A_log, self.dt_bias)
 
         # Expand Q/K if num_v_heads > num_k_heads (grouped)
         ratio = self.num_v_heads // self.num_k_heads

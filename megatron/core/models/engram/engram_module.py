@@ -40,6 +40,19 @@ try:
 except ImportError:
     causal_conv1d_fn = None
 
+try:
+    from megatron.core.fusions.fused_engram_lookup import (
+        fused_engram_hash_and_gather,
+        fused_engram_hash_gather_headproj,
+        _HAVE_TRITON as _ENGRAM_HAVE_TRITON,
+    )
+except ImportError:
+    fused_engram_hash_and_gather = None
+    fused_engram_hash_gather_headproj = None
+    _ENGRAM_HAVE_TRITON = False
+
+from megatron.core.fusions.fused_sigmoid_mul import fused_sigmoid_mul
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -217,7 +230,18 @@ class NgramHashMapping(nn.Module):
             all_ho.append(ho)
         # persistent=False: このバッファは計算用途のみ。
         # checkpoint への保存・読み込み対象外にする。
-        self.register_buffer('head_offsets_per_order', torch.stack(all_ho), persistent=False)  # [num_orders, n_head]
+        ho_stacked = torch.stack(all_ho)  # [num_orders, n_head]
+        self.register_buffer('head_offsets_per_order', ho_stacked, persistent=False)
+
+        # Flattened [num_orders * n_head] for fused kernel consumption.
+        self.register_buffer('head_base_flat', ho_stacked.reshape(-1).contiguous(), persistent=False)
+
+        # Primes as a 1-D int64 tensor for fused kernel consumption.
+        self.register_buffer(
+            'primes_tensor',
+            torch.tensor(self.primes, dtype=torch.long),
+            persistent=False,
+        )
 
         # Precompute hash multipliers: [num_ngram_orders, n_head, max_ngram_size]
         multipliers = self._build_multipliers(config, layer_id)
@@ -453,22 +477,42 @@ class EngramModule(nn.Module):
         # 1. Compress vocabulary
         compressed = self.tokenizer(input_ids)  # [B, S]
 
-        # 2. Generate N-gram hash indices
-        indices = self.ngram_hash(compressed)  # [B, S, total_heads]
-
-        # 3. Look up multi-head embeddings
-        emb = self.multi_head_emb(indices)  # [B, S, total_heads, n_embed]
-
-        # 4. Flatten heads and project to single embedding
-        emb_flat = emb.view(B, S, -1)       # [B, S, total_heads * n_embed]
-        emb = self.head_proj(emb_flat)       # [B, S, n_embed]
+        # 2–5. Fused hash + gather + head_proj (Approach B).
+        #      The full path including the head_proj matmul is wrapped in
+        #      a single autograd.Function so that emb_flat ([B, S,
+        #      total_heads * n_embed] ~ 352 MB per layer at MBS=4/S=4096)
+        #      is NOT persisted to save_for_backward.  backward regenerates
+        #      it from the saved ``indices`` tensor via F.embedding.
+        #
+        #      Falls back gracefully when Triton / CUDA is unavailable.
+        use_fused_headproj = (
+            _ENGRAM_HAVE_TRITON
+            and fused_engram_hash_gather_headproj is not None
+            and compressed.is_cuda
+            and self.multi_head_emb.table.weight.is_cuda
+        )
+        if use_fused_headproj:
+            emb = fused_engram_hash_gather_headproj(
+                compressed,
+                self.multi_head_emb.table.weight,
+                self.head_proj.weight,
+                self.ngram_hash.multipliers,
+                self.ngram_hash.primes_tensor,
+                self.ngram_hash.head_base_flat,
+            )                                     # [B, S, n_embed]
+        else:
+            # Pure-PyTorch fallback: replicate the original 3-step gather
+            # then apply head_proj as an nn.Linear.
+            indices = self.ngram_hash(compressed)        # [B, S, total_heads]
+            emb_bf = self.multi_head_emb(indices)         # [B, S, total_heads, n_embed]
+            emb_flat = emb_bf.view(B, S, -1)               # [B, S, total_heads * n_embed]
+            emb = self.head_proj(emb_flat)                  # [B, S, n_embed]
 
         # 5. Short convolution (local sequence fusion)
         emb = self.short_conv(emb)           # [B, S, n_embed]
 
-        # 6. Context-aware gating
-        gate = torch.sigmoid(self.gate_proj(hidden_bsf))  # [B, S, n_embed]
-        emb = gate * emb                                   # [B, S, n_embed]
+        # 6. Context-aware gating (fused sigmoid + mul)
+        emb = fused_sigmoid_mul(self.gate_proj(hidden_bsf), emb)
 
         # 7. Project to hidden size
         out = self.out_proj(emb)             # [B, S, D]
