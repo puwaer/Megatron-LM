@@ -162,10 +162,36 @@ def _load_checkpoint_impl(queue, args):
             msg['mlp l0 weight']  = megatron[f'{src}.mlp.linear_fc1.weight']
             msg['mlp l1 weight']  = megatron[f'{src}.mlp.linear_fc2.weight']
         else:
-            msg['input norm weight'] = megatron[f'{src}.input_layernorm.weight']
-            msg['post norm weight']  = megatron[f'{src}.post_attention_layernorm.weight']
+            # B-6: GDN では TELayerNormColumnParallelLinear により
+            #   input_layernorm.weight + in_proj_qkvz.weight + in_proj_ba.weight
+            # が以下の 2 キーに統合されている:
+            #   linear_attn.input_ln_proj.layer_norm_weight      [D]
+            #   linear_attn.input_ln_proj.weight                 [proj_qkvz + proj_ba, D]
+            # 下流 (saver_susono_hf など) は旧レイアウトを期待するため、ここで
+            # 逆変換 (split + rename) して msg に入れる。
+            fused_ln = f'{src}.linear_attn.input_ln_proj.layer_norm_weight'
+            fused_w = f'{src}.linear_attn.input_ln_proj.weight'
+            if fused_ln in megatron and fused_w in megatron:
+                # B-6 fused format
+                msg['input norm weight'] = megatron[fused_ln]
+                w = megatron[fused_w]
+                # num_v_heads * 2 = proj_ba; 残りが proj_qkvz
+                num_v_heads = int(cfg.get('linear_num_value_heads', 32))
+                proj_ba = num_v_heads * 2
+                proj_qkvz = w.shape[0] - proj_ba
+                msg['linear_attn.in_proj_qkvz.weight'] = w[:proj_qkvz].contiguous()
+                msg['linear_attn.in_proj_ba.weight'] = w[proj_qkvz:].contiguous()
+                fused_skip_keys = {fused_ln, fused_w}
+            else:
+                # 旧 (B-6 以前) レイアウト
+                msg['input norm weight'] = megatron[f'{src}.input_layernorm.weight']
+                fused_skip_keys = set()
+
+            msg['post norm weight'] = megatron[f'{src}.post_attention_layernorm.weight']
 
             for meg_key, val in megatron.items():
+                if meg_key in fused_skip_keys:
+                    continue
                 if meg_key.startswith(f'{src}.linear_attn.'):
                     subkey = meg_key[len(f'{src}.linear_attn.'):]
                     msg[f'linear_attn.{subkey}'] = val

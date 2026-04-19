@@ -92,11 +92,17 @@ class SusonoLinearAttentionDecoderLayer(MegatronModule):
         eps = getattr(config, 'layernorm_epsilon', 1e-6)
 
         # Norms
-        self.input_layernorm          = _RMSNorm(D, eps=eps)
         self.post_attention_layernorm = _RMSNorm(D, eps=eps)
 
-        # Linear attention
+        # Linear attention.  When GDN was able to build the fused
+        # ``input_ln_proj`` (TELayerNormColumnParallelLinear) module it owns
+        # the pre-attention RMSNorm internally and we skip the external call.
         self.linear_attn = SusonoGatedDeltaNet(config, layer_idx=self.layer_idx)
+
+        if getattr(self.linear_attn, 'input_ln_proj', None) is not None:
+            self.input_layernorm = None           # norm lives inside linear_attn
+        else:
+            self.input_layernorm = _RMSNorm(D, eps=eps)
 
         # Feed-forward (MoE or dense)
         if mlp_only:
@@ -123,6 +129,66 @@ class SusonoLinearAttentionDecoderLayer(MegatronModule):
         self._current_input_ids: Optional[Tensor] = None
 
     # ------------------------------------------------------------------
+    # Checkpoint migration: old format → B-6 fused format
+    # ------------------------------------------------------------------
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Migrate pre-B-6 checkpoints on-the-fly.
+
+        Old layout (pre-B-6):
+            {prefix}input_layernorm.weight                     [D]
+            {prefix}linear_attn.in_proj_qkvz.weight            [proj_qkvz, D]
+            {prefix}linear_attn.in_proj_ba.weight              [proj_ba, D]
+
+        New layout (B-6 fused):
+            {prefix}linear_attn.input_ln_proj.layer_norm_weight  [D]
+            {prefix}linear_attn.input_ln_proj.weight             [proj_qkvz + proj_ba, D]
+
+        Only runs the concat+rename when the old keys are present and the
+        current module actually owns the fused path.  If the state_dict is
+        already in the new format, this is a no-op.
+        """
+        old_ln = prefix + 'input_layernorm.weight'
+        old_qkvz = prefix + 'linear_attn.in_proj_qkvz.weight'
+        old_ba = prefix + 'linear_attn.in_proj_ba.weight'
+        new_ln = prefix + 'linear_attn.input_ln_proj.layer_norm_weight'
+        new_w = prefix + 'linear_attn.input_ln_proj.weight'
+
+        has_fused = (
+            self.input_layernorm is None
+            and getattr(self.linear_attn, 'input_ln_proj', None) is not None
+        )
+
+        if has_fused:
+            # Migrate layernorm weight
+            if old_ln in state_dict and new_ln not in state_dict:
+                state_dict[new_ln] = state_dict.pop(old_ln)
+            # Migrate concatenated projection weight
+            if (
+                old_qkvz in state_dict
+                and old_ba in state_dict
+                and new_w not in state_dict
+            ):
+                state_dict[new_w] = torch.cat(
+                    [state_dict.pop(old_qkvz), state_dict.pop(old_ba)],
+                    dim=0,
+                )
+
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs,
+        )
+
+    # ------------------------------------------------------------------
     # Core layer computation (single stream, [S, B, D])
     # ------------------------------------------------------------------
 
@@ -145,7 +211,11 @@ class SusonoLinearAttentionDecoderLayer(MegatronModule):
         """
         # ── Linear attention ──────────────────────────────────────────
         residual = x
-        x = self.input_layernorm(x)
+        if self.input_layernorm is not None:
+            # Legacy path: external RMSNorm feeds GDN's separate projections.
+            x = self.input_layernorm(x)
+        # Fused path: GDN's ``input_ln_proj`` (TELayerNormColumnParallelLinear)
+        # applies the RMSNorm internally before the QKVZ+BA projection.
         x = self.linear_attn(
             x,
             inference_cache=inference_cache,

@@ -112,11 +112,33 @@ def _save_checkpoint_impl(queue, args):
             state_dict[f'{pfx}.mlp.linear_fc2.weight']                            = msg['mlp l1 weight']
         else:
             # Linear Attention 層
-            state_dict[f'{pfx}.input_layernorm.weight']          = msg['input norm weight']
+            # B-6: GDN が TELayerNormColumnParallelLinear で norm+qkvz+ba を
+            # 融合所持しているため、Megatron 側パラメータを以下のように統合:
+            #   input_layernorm.weight + linear_attn.in_proj_qkvz.weight +
+            #   linear_attn.in_proj_ba.weight  →
+            #   linear_attn.input_ln_proj.layer_norm_weight +
+            #   linear_attn.input_ln_proj.weight (concat qkvz||ba, dim=0)
+            # msg 側のキーは旧レイアウトのままなので、ここで変換する。
             state_dict[f'{pfx}.post_attention_layernorm.weight'] = msg['post norm weight']
 
-            # GatedDeltaNet / MoE キーを全転送
+            qkvz_key = 'linear_attn.in_proj_qkvz.weight'
+            ba_key = 'linear_attn.in_proj_ba.weight'
+            if qkvz_key in msg and ba_key in msg:
+                # B-6 fused layout
+                state_dict[f'{pfx}.linear_attn.input_ln_proj.layer_norm_weight'] = (
+                    msg['input norm weight']
+                )
+                state_dict[f'{pfx}.linear_attn.input_ln_proj.weight'] = torch.cat(
+                    [msg[qkvz_key], msg[ba_key]], dim=0,
+                )
+            else:
+                # 旧レイアウト fallback (TE 未利用時など)
+                state_dict[f'{pfx}.input_layernorm.weight'] = msg['input norm weight']
+
+            # GDN の残り (out_proj, A_log, dt_bias, conv1d 等) + MoE キー
             for key, val in msg.items():
+                if key in (qkvz_key, ba_key):
+                    continue
                 if key.startswith('linear_attn.') or key.startswith('mlp.'):
                     state_dict[f'{pfx}.{key}'] = val
 
@@ -153,6 +175,16 @@ def _save_checkpoint_impl(queue, args):
                     'self_attention.linear_proj', 'pre_mlp_layernorm',
                     'mlp.linear_fc1', 'mlp.linear_fc2']:
             state_dict[f'{pfx}.{sub}._extra_state/shard_0_1'] = io.BytesIO(_te_es)
+
+    # B-6: Linear-attention (GDN) 層も TELayerNormColumnParallelLinear を持つので
+    # ``linear_attn.input_ln_proj._extra_state`` を書き出す必要がある。
+    # full_attn_layers に含まれない層だけ (GDN 層) が対象。
+    linear_attn_layers = [i for i in range(num_layers) if i not in full_attn_layers]
+    for i in linear_attn_layers:
+        pfx = f'decoder.layers.{i}'
+        state_dict[f'{pfx}.linear_attn.input_ln_proj._extra_state/shard_0_1'] = (
+            io.BytesIO(_te_es)
+        )
 
     state_dict['decoder.final_layernorm._extra_state/shard_0_1'] = io.BytesIO(_te_es)
 
