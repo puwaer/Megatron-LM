@@ -245,19 +245,22 @@ if _TRITON_AVAILABLE:
     @triton.jit
     def _fused_mhc_output_kernel(
         # Inputs
-        X_ptr,             # [T, n, D]  (T-first layout, n=4 streams each D elements)
-        wc_ptr,            # [T, n_alpha]
-        dc_ptr,            # [T, n_beta]
-        static_alpha_ptr,  # [n_alpha]
-        static_beta_ptr,   # [n_beta]
-        perms_ptr,         # [n_perms * n * n]  (flattened, bfloat16 or float32)
-        pre_branch_scale,  # scalar (float)
-        residual_scale,    # scalar (float)
-        h_post_scale,      # scalar (float)
+        X_ptr,                # [T, n, D]  (T-first layout, n=4 streams each D elements)
+        wc_ptr,               # [T, n_alpha]
+        dc_ptr,               # [T, n_beta]
+        static_alpha_ptr,     # [n_alpha]
+        static_beta_ptr,      # [n_beta]
+        perms_ptr,            # [n_perms * n * n]  (flattened, bfloat16 or float32)
+        # Scalar scales are passed as 1-element tensors to avoid the CPU↔GPU
+        # sync that `.item()` would trigger on the Python side.  The kernel
+        # loads the single element once and uses it as a runtime scalar.
+        pre_branch_scale_ptr,
+        residual_scale_ptr,
+        h_post_scale_ptr,
         # Outputs
-        branch_input_ptr,   # [T, D]
-        new_residuals_ptr,  # [T, n, D]
-        beta_ptr,           # [T, n]
+        branch_input_ptr,     # [T, D]
+        new_residuals_ptr,    # [T, n, D]
+        beta_ptr,             # [T, n]
         # Dimensions
         T,
         n: tl.constexpr,            # number of streams (must be 4)
@@ -273,6 +276,11 @@ if _TRITON_AVAILABLE:
         token_id = tl.program_id(0)
         if token_id >= T:
             return
+
+        # Load the three runtime scalar scales once from GPU memory (no CPU sync).
+        pre_branch_scale = tl.load(pre_branch_scale_ptr).to(tl.float32)
+        residual_scale = tl.load(residual_scale_ptr).to(tl.float32)
+        h_post_scale = tl.load(h_post_scale_ptr).to(tl.float32)
 
         # ---- Load wc in two parts (slice notation unsupported in this Triton version) ----
         wc_base = token_id * N_ALPHA_PAD
@@ -521,10 +529,11 @@ if _TRITON_AVAILABLE:
         d_pbs_acc_ptr,            # [1]
         d_rs_acc_ptr,             # [1]
         d_hps_acc_ptr,            # [1]
-        # Scalar scales
-        pre_branch_scale,     # float
-        residual_scale,       # float
-        h_post_scale,         # float
+        # Scalar scales as 1-element tensors (loaded once per program to avoid
+        # CPU↔GPU sync that `.item()` would incur).
+        pre_branch_scale_ptr,
+        residual_scale_ptr,
+        h_post_scale_ptr,
         # Dims
         T,
         n: tl.constexpr,
@@ -543,6 +552,10 @@ if _TRITON_AVAILABLE:
         t = tl.program_id(0)
         if t >= T:
             return
+
+        pre_branch_scale = tl.load(pre_branch_scale_ptr).to(tl.float32)
+        residual_scale = tl.load(residual_scale_ptr).to(tl.float32)
+        h_post_scale = tl.load(h_post_scale_ptr).to(tl.float32)
 
         cols_n = tl.arange(0, n)
         res_idx = tl.arange(0, N_PERMS_PAD)
@@ -835,24 +848,17 @@ if _TRITON_AVAILABLE:
             wc_scratch[:, :n_alpha] = wc.to(torch.float32)
             dc_scratch.copy_(dc.to(torch.float32))
 
-            # Materialise scalar scales ONCE per forward.  Each `.item()` call
-            # forces a GPU→CPU sync; caching them across Pass2 launch, into
-            # ctx for backward, and (previously) a repeat in the backward
-            # helper used to cost ~600 ms of blocking per iteration.
-            pbs_f = float(pre_branch_scale.item())
-            rs_f = float(residual_scale.item())
-            hps_f = float(h_post_scale.item())
-
-            # Pass 2: compute alpha_pre, H_res (in registers), outputs
-            # BLOCK_D / num_warps / num_stages are picked by @triton.autotune.
+            # Pass 2: compute alpha_pre, H_res (in registers), outputs.
+            # Scale parameters are passed as 1-element tensors (no `.item()`
+            # sync); the kernel loads the scalar once per program.
             _fused_mhc_output_kernel[(T,)](
                 X_flat,          # [T, n, D] for stream-aware access
                 wc_scratch, dc_scratch,
                 static_alpha, static_beta,
                 perms_flat.reshape(-1),   # flatten to 1D for simple pointer math
-                pbs_f,
-                rs_f,
-                hps_f,
+                pre_branch_scale,
+                residual_scale,
+                h_post_scale,
                 branch_input, new_residuals, beta_out,
                 T=T, n=n, D=D, n_alpha=n_alpha, n_perms=n_perms, n_beta=n_beta,
                 N_ALPHA_PAD=N_ALPHA_PAD, N_PERMS_PAD=N_PERMS_PAD,
@@ -868,10 +874,6 @@ if _TRITON_AVAILABLE:
                 wc_scratch, dc_scratch,
             )
             ctx.T, ctx.n, ctx.D, ctx.n_perms = T, n, D, n_perms
-            # Cache scalar scales so backward avoids repeat .item() syncs.
-            ctx.pbs_f = pbs_f
-            ctx.rs_f = rs_f
-            ctx.hps_f = hps_f
             return branch_input, new_residuals, beta_out
 
         @staticmethod
@@ -907,8 +909,6 @@ if _TRITON_AVAILABLE:
                 perms_flat, pbs, rs, hps,
                 wc_scratch, dc_scratch,
                 T, n, D, n_perms,
-                # Pre-computed scalar scales (avoid .item() sync in backward).
-                pbs_f=ctx.pbs_f, rs_f=ctx.rs_f, hps_f=ctx.hps_f,
             )
 
 
@@ -980,11 +980,6 @@ if _TRITON_AVAILABLE:
         n: int,
         D: int,
         n_perms: int,
-        # Pre-computed scalar scales passed by the caller so we don't have
-        # to call `.item()` again (each sync costs ~600 ms in the profile).
-        pbs_f: float = None,
-        rs_f: float = None,
-        hps_f: float = None,
     ):
         """All-Triton (plus cuBLAS GEMMs) backward for _width_connection.
 
@@ -1008,23 +1003,22 @@ if _TRITON_AVAILABLE:
         wc_pre = wc_scratch[:, :n].contiguous()                               # [T, n]
         wc_res = wc_scratch[:, n:n + n_perms].contiguous()                    # [T, n_perms]
 
-        # Fallback only if caller did not provide cached scalars
-        # (e.g. direct debug invocation without the autograd Function).
-        if pbs_f is None:
-            pbs_f = float(pre_branch_scale.item())
-        if rs_f is None:
-            rs_f = float(residual_scale.item())
-        if hps_f is None:
-            hps_f = float(h_post_scale.item())
-
+        # Use the live scalar tensors (shape [1]) directly in PyTorch ops so
+        # the .item() sync is avoided.  These are contiguous 1-element
+        # tensors that cuBLAS-compatible ops broadcast against multi-dim
+        # arguments without materialising an intermediate Python scalar.
         sa_pre = static_alpha[:n].to(torch.float32)
         sa_res = static_alpha[n:n + n_perms].to(torch.float32)
         sb = static_beta.to(torch.float32)
 
-        alpha_pre_f = torch.sigmoid(pbs_f * wc_pre + sa_pre)                 # [T, n] fp32
-        logit_res = rs_f * wc_res + sa_res
+        pbs_t = pre_branch_scale.to(torch.float32)
+        rs_t = residual_scale.to(torch.float32)
+        hps_t = h_post_scale.to(torch.float32)
+
+        alpha_pre_f = torch.sigmoid(pbs_t * wc_pre + sa_pre)                 # [T, n] fp32
+        logit_res = rs_t * wc_res + sa_res
         res_coeff_f = torch.softmax(logit_res, dim=-1)                       # [T, n_perms]
-        beta_f = torch.sigmoid(hps_f * dc_scratch + sb) * 2.0                # [T, n]
+        beta_f = torch.sigmoid(hps_t * dc_scratch + sb) * 2.0                # [T, n]
 
         # ------------------------------------------------------------------
         # Pass-B1: launch Triton kernel for token-local gradients
@@ -1052,7 +1046,8 @@ if _TRITON_AVAILABLE:
             d_wc, d_dc, d_X_partial,
             d_static_alpha_acc, d_static_beta_acc,
             d_pbs_acc, d_rs_acc, d_hps_acc,
-            pbs_f, rs_f, hps_f,
+            # Pass the scale tensors directly; kernel loads each via tl.load.
+            pre_branch_scale, residual_scale, h_post_scale,
             T=T, n=n, D=D, n_perms=n_perms, n_alpha=n_alpha,
             N_PERMS_PAD=N_PERMS_PAD,
             BLOCK_D=BLOCK_D,
