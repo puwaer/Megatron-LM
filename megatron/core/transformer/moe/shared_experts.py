@@ -60,8 +60,15 @@ class SharedExpertMLP(MLP):
                 config.init_method(self.gate_weight)
             self.gate_weight.data = self.gate_weight.data.to(dtype=config.params_dtype)
             setattr(self.gate_weight, 'sequence_parallel', self.config.sequence_parallel)
+
+            bias_init = getattr(self.config, 'moe_shared_expert_gate_bias_init', 0.0)
+            self.gate_bias = torch.nn.Parameter(
+                torch.full((1,), bias_init, dtype=config.params_dtype)
+            )
+            setattr(self.gate_bias, 'sequence_parallel', self.config.sequence_parallel)
         else:
             self.gate_weight = None
+            self.gate_bias = None
 
         if (
             self.config.fp8
@@ -128,6 +135,7 @@ class SharedExpertMLP(MLP):
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
+            logits = logits + self.gate_bias
             gate_score = torch.nn.functional.sigmoid(logits)
             output = output * gate_score
         return output
@@ -138,17 +146,18 @@ class SharedExpertMLP(MLP):
         """Gets sharded state dict."""
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         if self.use_shared_expert_gate:
-            name = 'gate_weight'
             state_dict = self.state_dict(prefix='', keep_vars=True)
-            sub_sd = {
-                f'{prefix}{name}': make_sharded_tensor_for_checkpoint(
+            sub_sd = {}
+            for name in ('gate_weight', 'gate_bias'):
+                if name not in state_dict:
+                    continue
+                sub_sd[f'{prefix}{name}'] = make_sharded_tensor_for_checkpoint(
                     state_dict[name],
                     f'{prefix}{name}',
                     prepend_offsets=sharded_offsets,
                     tp_group=self.tp_group,
                     dp_cp_group=metadata['dp_cp_group'],
                 )
-            }
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
@@ -164,6 +173,7 @@ class SharedExpertMLP(MLP):
         with torch.cuda.stream(self.stream):
             if self.use_shared_expert_gate:
                 logits = torch.nn.functional.linear(input, self.gate_weight)
+                logits = logits + self.gate_bias
                 self.gate_score = torch.nn.functional.sigmoid(logits)
             if self.config.sequence_parallel:
                 self.cached_fc1_input = gather_from_sequence_parallel_region(

@@ -553,8 +553,14 @@ class TransformerConfig(ModelParallelConfig):
     in the hidden_states gradient."""
 
     moe_shared_expert_gate: bool = False
-    """Enable gate for shared expert. Only effective when 
+    """Enable gate for shared expert. Only effective when
     moe-shared-expert-intermediate-size is set."""
+
+    moe_shared_expert_gate_bias_init: float = 0.0
+    """Initial value for the shared expert gate bias. Positive values (e.g., 2.0) make the
+    shared expert dominant at training start (sigmoid(2)≈0.88), helping expert balance
+    for fine-grained MoE. Default 0.0 preserves legacy behavior (sigmoid(0)=0.5).
+    Only effective when moe_shared_expert_gate is True."""
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.

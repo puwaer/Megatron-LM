@@ -702,7 +702,7 @@ def topk_routing_with_score_function(
             raise ValueError(
                 "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
             )
-        return fused_topk_with_score_function(
+        probs, top_indices = fused_topk_with_score_function(
             logits=logits,
             topk=topk,
             use_pre_softmax=use_pre_softmax,
@@ -712,6 +712,9 @@ def topk_routing_with_score_function(
             score_function=score_function,
             expert_bias=expert_bias,
         )
+        if use_pre_softmax and score_function == "softmax" and topk > 1:
+            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
+        return probs, top_indices
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -758,6 +761,8 @@ def topk_routing_with_score_function(
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
             probs, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            if topk > 1:
+                probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)

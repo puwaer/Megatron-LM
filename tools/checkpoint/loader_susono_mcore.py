@@ -189,6 +189,8 @@ def _load_checkpoint_impl(queue, args):
 
             msg['post norm weight'] = megatron[f'{src}.post_attention_layernorm.weight']
 
+            # Susono は HF-compatible な key 名を mcore 側でもそのまま使用しているため、
+            # generic pass-through で OK (リネーム不要)。
             for meg_key, val in megatron.items():
                 if meg_key in fused_skip_keys:
                     continue

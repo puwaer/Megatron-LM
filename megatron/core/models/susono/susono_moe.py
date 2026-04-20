@@ -721,7 +721,10 @@ class SusonoSparseMoE(nn.Module):
             intermediate_size=moe_inter,
         )
         self.shared_expert      = _SwiGLUMLP(hidden, shared_inter)
-        self.shared_expert_gate = nn.Linear(hidden, 1, bias=False)
+        gate_bias_init = getattr(config, 'moe_shared_expert_gate_bias_init', 0.0)
+        self.shared_expert_gate = nn.Linear(hidden, 1, bias=True)
+        with torch.no_grad():
+            self.shared_expert_gate.bias.fill_(gate_bias_init)
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Sharded state dict for dist_checkpointing.

@@ -136,6 +136,8 @@ def _save_checkpoint_impl(queue, args):
                 state_dict[f'{pfx}.input_layernorm.weight'] = msg['input norm weight']
 
             # GDN の残り (out_proj, A_log, dt_bias, conv1d 等) + MoE キー
+            # Susono は HF-compatible な key 名を mcore 側でもそのまま使用
+            # (shared_expert_gate.weight/.bias, shared_expert.{gate,up,down}_proj.weight 等)。
             for key, val in msg.items():
                 if key in (qkvz_key, ba_key):
                     continue
@@ -236,10 +238,21 @@ def _write_sidecars(base_dir: str, iter_dir: str, md, args) -> None:
         json.dump(metadata, f)
 
     # common.pt (iter ディレクトリ内)
+    # Megatron の check_checkpoint_args (training/checkpointing.py:102-141) は
+    # resume 時に num_layers / hidden_size / num_attention_heads を無条件比較する。
+    # add_position_embedding は Megatron のデフォルトが True で、`--no-position-embedding`
+    # を渡さない限り True のまま保持される (`--position-embedding-type rope` とは独立)。
+    # Susono は `--position-embedding-type rope` を使うが add_position_embedding=True の
+    # ままなので、ckpt 側も True にして args 比較を通す。
     ckpt_args = types.SimpleNamespace(
         tensor_model_parallel_size=tp,
         pipeline_model_parallel_size=pp,
         expert_model_parallel_size=ep,
+        num_layers=md.num_layers,
+        hidden_size=md.hidden_size,
+        num_attention_heads=md.num_attention_heads,
+        add_position_embedding=True,
+        max_position_embeddings=getattr(md, 'max_position_embeddings', 4096),
     )
     common_state = {
         'args': ckpt_args,
