@@ -127,15 +127,40 @@ def _load_checkpoint_impl(queue, args):
             msg['post norm weight']        = hf[f'{hf_prefix}post_attention_layernorm.weight'] + 1.0
 
             # QKV インターリーブ (GQA: [kv_heads, q_per_kv+2, head_dim, hidden])
-            q = hf[f'{hf_prefix}self_attn.q_proj.weight']
+            # attention_output_gate=True の場合、q_proj は shape [heads*head_dim*2, hidden]
+            # per-head layout: [q_head(head_dim), gate_head(head_dim)] が head 毎に連続
+            # → Megatron の linear_qkv layout [q_heads_per_group, gate_heads_per_group, k_head, v_head]
+            # に並び替える
+            q_hf = hf[f'{hf_prefix}self_attn.q_proj.weight']
             k_w = hf[f'{hf_prefix}self_attn.k_proj.weight']
             v   = hf[f'{hf_prefix}self_attn.v_proj.weight']
             num_q_per_kv = num_attn_heads // num_kv_heads
-            q   = q.view(num_kv_heads, num_q_per_kv, head_dim, hidden_size)
-            k_w = k_w.view(num_kv_heads, 1,            head_dim, hidden_size)
-            v   = v.view(num_kv_heads, 1,               head_dim, hidden_size)
-            msg['qkv weight']  = torch.cat([q, k_w, v], dim=1).view(-1, hidden_size)
+
+            has_gate = q_hf.shape[0] == num_attn_heads * head_dim * 2
+            if has_gate:
+                # HF q_proj: [num_kv_heads, num_q_per_kv, 2, head_dim, hidden] (per-head q/gate interleave)
+                q_and_gate = q_hf.view(num_kv_heads, num_q_per_kv, 2, head_dim, hidden_size)
+                q    = q_and_gate[:, :, 0]   # [num_kv_heads, num_q_per_kv, head_dim, hidden]
+                gate = q_and_gate[:, :, 1]
+            else:
+                q = q_hf.view(num_kv_heads, num_q_per_kv, head_dim, hidden_size)
+                gate = None
+            k_w = k_w.view(num_kv_heads, 1, head_dim, hidden_size)
+            v   = v.view(num_kv_heads, 1, head_dim, hidden_size)
+            if has_gate:
+                # Megatron layout per group: [q, gate, k, v]
+                msg['qkv weight'] = torch.cat([q, gate, k_w, v], dim=1).view(-1, hidden_size)
+            else:
+                msg['qkv weight'] = torch.cat([q, k_w, v], dim=1).view(-1, hidden_size)
             msg['dense weight'] = hf[f'{hf_prefix}self_attn.o_proj.weight']
+
+            # QK LayerNorm (Qwen3-Next style per-head RMSNorm)
+            q_norm_key = f'{hf_prefix}self_attn.q_norm.weight'
+            k_norm_key = f'{hf_prefix}self_attn.k_norm.weight'
+            if q_norm_key in hf:
+                msg['q layernorm weight'] = hf[q_norm_key]
+            if k_norm_key in hf:
+                msg['k layernorm weight'] = hf[k_norm_key]
 
             # SwiGLU: gate_proj と up_proj を結合 → linear_fc1
             gate = hf[f'{hf_prefix}mlp.gate_proj.weight']

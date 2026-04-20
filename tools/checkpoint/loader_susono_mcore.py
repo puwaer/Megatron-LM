@@ -161,6 +161,12 @@ def _load_checkpoint_impl(queue, args):
             msg['post norm weight'] = megatron[f'{src}.pre_mlp_layernorm.weight']
             msg['mlp l0 weight']  = megatron[f'{src}.mlp.linear_fc1.weight']
             msg['mlp l1 weight']  = megatron[f'{src}.mlp.linear_fc2.weight']
+            q_norm_key = f'{src}.self_attention.q_layernorm.weight'
+            k_norm_key = f'{src}.self_attention.k_layernorm.weight'
+            if q_norm_key in megatron:
+                msg['q layernorm weight'] = megatron[q_norm_key]
+            if k_norm_key in megatron:
+                msg['k layernorm weight'] = megatron[k_norm_key]
         else:
             # B-6: GDN では TELayerNormColumnParallelLinear により
             #   input_layernorm.weight + in_proj_qkvz.weight + in_proj_ba.weight

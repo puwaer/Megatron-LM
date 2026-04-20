@@ -110,6 +110,11 @@ def _save_checkpoint_impl(queue, args):
             state_dict[f'{pfx}.pre_mlp_layernorm.weight']                         = msg['post norm weight']
             state_dict[f'{pfx}.mlp.linear_fc1.weight']                            = msg['mlp l0 weight']
             state_dict[f'{pfx}.mlp.linear_fc2.weight']                            = msg['mlp l1 weight']
+            # QK LayerNorm (Qwen3-Next-style per-head RMSNorm, optional)
+            if 'q layernorm weight' in msg:
+                state_dict[f'{pfx}.self_attention.q_layernorm.weight'] = msg['q layernorm weight']
+            if 'k layernorm weight' in msg:
+                state_dict[f'{pfx}.self_attention.k_layernorm.weight'] = msg['k layernorm weight']
         else:
             # Linear Attention 層
             # B-6: GDN が TELayerNormColumnParallelLinear で norm+qkvz+ba を
@@ -171,11 +176,20 @@ def _save_checkpoint_impl(queue, args):
     torch.save([None], buf)
     _te_es = buf.getvalue()
 
+    # qk_layernorm が有効な場合、TE backend の q_layernorm/k_layernorm にも _extra_state が必要。
+    # state_dict に実重みが書かれているかで判定 (上記 full attention 分岐で条件付き書込済み)。
+    has_qk_layernorm = any(
+        k.endswith('.self_attention.q_layernorm.weight') for k in state_dict
+    )
+
     for i in full_attn_layers:
         pfx = f'decoder.layers.{i}'
-        for sub in ['input_layernorm', 'self_attention.linear_qkv',
-                    'self_attention.linear_proj', 'pre_mlp_layernorm',
-                    'mlp.linear_fc1', 'mlp.linear_fc2']:
+        subs = ['input_layernorm', 'self_attention.linear_qkv',
+                'self_attention.linear_proj', 'pre_mlp_layernorm',
+                'mlp.linear_fc1', 'mlp.linear_fc2']
+        if has_qk_layernorm:
+            subs.extend(['self_attention.q_layernorm', 'self_attention.k_layernorm'])
+        for sub in subs:
             state_dict[f'{pfx}.{sub}._extra_state/shard_0_1'] = io.BytesIO(_te_es)
 
     # B-6: Linear-attention (GDN) 層も TELayerNormColumnParallelLinear を持つので

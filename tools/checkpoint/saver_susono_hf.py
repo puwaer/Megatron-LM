@@ -106,27 +106,46 @@ def _save_checkpoint_impl(queue, args):
             hf[f'{dst}.post_attention_layernorm.weight'] = msg['post norm weight']
 
             # QKV 分割 (GQA インターリーブを解除)
+            # attention_output_gate=True の場合、mcore linear_qkv per-group layout は
+            # [q_heads_per_group, gate_heads_per_group, k_head, v_head]
+            # → HF 側は q/gate を per-head interleave して q_proj.weight (2x 出力) に結合、
+            #   k_proj / v_proj / o_proj は通常通り
             qkv_w   = msg['qkv weight']
             hidden  = qkv_w.shape[1]
             num_q_per_kv = num_attn_heads // num_kv_heads
-            qkv_r   = qkv_w.view(num_kv_heads, num_q_per_kv + 2, head_dim, hidden)
-
-            hf[f'{dst}.self_attn.q_proj.weight'] = (
-                qkv_r[:, :num_q_per_kv]
-                .reshape(num_attn_heads * head_dim, hidden)
-                .contiguous()
-            )
+            total_heads_per_group = qkv_w.shape[0] // (num_kv_heads * head_dim)
+            has_gate = total_heads_per_group == (2 * num_q_per_kv + 2)
+            if has_gate:
+                qkv_r = qkv_w.view(num_kv_heads, 2 * num_q_per_kv + 2, head_dim, hidden)
+                q    = qkv_r[:, :num_q_per_kv]                    # [kv, q_per_kv, head_dim, hidden]
+                gate = qkv_r[:, num_q_per_kv:2 * num_q_per_kv]
+                k_w  = qkv_r[:, 2 * num_q_per_kv:2 * num_q_per_kv + 1]
+                v    = qkv_r[:, 2 * num_q_per_kv + 1:]
+                # HF per-head layout: [q_head(head_dim), gate_head(head_dim)] interleaved
+                q_and_gate = torch.stack([q, gate], dim=2)  # [kv, q_per_kv, 2, head_dim, hidden]
+                hf[f'{dst}.self_attn.q_proj.weight'] = (
+                    q_and_gate.reshape(num_attn_heads * head_dim * 2, hidden).contiguous()
+                )
+            else:
+                qkv_r = qkv_w.view(num_kv_heads, num_q_per_kv + 2, head_dim, hidden)
+                q   = qkv_r[:, :num_q_per_kv]
+                k_w = qkv_r[:, num_q_per_kv:num_q_per_kv + 1]
+                v   = qkv_r[:, num_q_per_kv + 1:]
+                hf[f'{dst}.self_attn.q_proj.weight'] = (
+                    q.reshape(num_attn_heads * head_dim, hidden).contiguous()
+                )
             hf[f'{dst}.self_attn.k_proj.weight'] = (
-                qkv_r[:, num_q_per_kv:num_q_per_kv + 1]
-                .reshape(num_kv_heads * head_dim, hidden)
-                .contiguous()
+                k_w.reshape(num_kv_heads * head_dim, hidden).contiguous()
             )
             hf[f'{dst}.self_attn.v_proj.weight'] = (
-                qkv_r[:, num_q_per_kv + 1:]
-                .reshape(num_kv_heads * head_dim, hidden)
-                .contiguous()
+                v.reshape(num_kv_heads * head_dim, hidden).contiguous()
             )
             hf[f'{dst}.self_attn.o_proj.weight'] = msg['dense weight']
+            # QK LayerNorm (optional)
+            if 'q layernorm weight' in msg:
+                hf[f'{dst}.self_attn.q_norm.weight'] = msg['q layernorm weight']
+            if 'k layernorm weight' in msg:
+                hf[f'{dst}.self_attn.k_norm.weight'] = msg['k layernorm weight']
 
             # SwiGLU 分割 (linear_fc1 → gate_proj + up_proj)
             fc1  = msg['mlp l0 weight']
