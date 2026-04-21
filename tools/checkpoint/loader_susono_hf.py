@@ -162,11 +162,21 @@ def _load_checkpoint_impl(queue, args):
             if k_norm_key in hf:
                 msg['k layernorm weight'] = hf[k_norm_key]
 
-            # SwiGLU: gate_proj と up_proj を結合 → linear_fc1
-            gate = hf[f'{hf_prefix}mlp.gate_proj.weight']
-            up   = hf[f'{hf_prefix}mlp.up_proj.weight']
-            msg['mlp l0 weight'] = torch.cat([gate, up], dim=0)
-            msg['mlp l1 weight'] = hf[f'{hf_prefix}mlp.down_proj.weight']
+            # MLP can be either Dense (SwiGLU) or MoE (Qwen3-Next full equivalence).
+            # Detect by checking whether the Dense-specific gate_proj key exists.
+            if f'{hf_prefix}mlp.gate_proj.weight' in hf:
+                # Dense SwiGLU MLP: merge gate_proj + up_proj → linear_fc1
+                gate_m = hf[f'{hf_prefix}mlp.gate_proj.weight']
+                up_m   = hf[f'{hf_prefix}mlp.up_proj.weight']
+                msg['mlp l0 weight'] = torch.cat([gate_m, up_m], dim=0)
+                msg['mlp l1 weight'] = hf[f'{hf_prefix}mlp.down_proj.weight']
+            else:
+                # MoE MLP: pass through all mlp.* keys as-is (Susono mcore uses
+                # HF-compatible naming for MoE parameters).
+                for hf_key, tensor in hf.items():
+                    if hf_key.startswith(f'{hf_prefix}mlp.'):
+                        subkey = hf_key[len(f'{hf_prefix}mlp.'):]
+                        msg[f'mlp.{subkey}'] = tensor
 
         else:
             # --- Linear Attention 層 ---

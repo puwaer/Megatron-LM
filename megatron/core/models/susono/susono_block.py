@@ -37,8 +37,10 @@ from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.models.engram.engram_module import EngramConfig, EngramModule
+from dataclasses import replace as _dc_replace
 from megatron.core.models.susono.mhc_transformer_layer import MHCTransformerLayer
 from megatron.core.models.susono.susono_hybrid_decoder_layer import SusonoLinearAttentionDecoderLayer
+from megatron.core.models.susono.susono_moe import SusonoSparseMoE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_block import (
     LayerNormImpl,
@@ -124,32 +126,56 @@ class SusonoBlock(TransformerBlock):
                 # specific ModuleSpec provided
                 layer_specs = [spec for _ in range(num_layers)]
 
-            # Override linear attention layers
+            # Qwen3-Next equivalent: MoE decision is INDEPENDENT of attention type.
+            # Both linear_attention and full_attention layers can be MoE or Dense,
+            # gated only by moe_layer_freq / mlp_only_layers.
             for i in range(num_layers):
                 layer_idx = i + offset
                 is_linear = ((layer_idx + 1) % full_interval) != 0
 
-                if is_linear:
-                    # Determine MoE usage for this layer
-                    # Standard logic: MoE if (layer_idx + 1) % frequency == 0
-                    use_moe = False
-                    if getattr(config, 'num_moe_experts', 0) > 0:
-                        freq = getattr(config, 'moe_layer_freq', 1)
-                        if (layer_idx + 1) % freq == 0:
-                            use_moe = True
-                        
-                        # Check explicitly excluded layers (mlp_only_layers)
-                        mlp_only_layers = getattr(config, 'mlp_only_layers', [])
-                        if layer_idx in mlp_only_layers:
-                            use_moe = False
+                # Determine MoE usage for this layer (attention-type-agnostic).
+                use_moe = False
+                if getattr(config, 'num_moe_experts', 0) > 0:
+                    freq = getattr(config, 'moe_layer_freq', 1)
+                    if (layer_idx + 1) % freq == 0:
+                        use_moe = True
+                    # Check explicitly excluded layers (mlp_only_layers)
+                    mlp_only_layers = getattr(config, 'mlp_only_layers', [])
+                    if layer_idx in mlp_only_layers:
+                        use_moe = False
 
-                    # Create linear attention spec
-                    # SusonoLinearAttentionDecoderLayer(config, layer_number, mlp_only=bool)
-                    mlp_only = not use_moe
+                if is_linear:
+                    # Linear attention (GatedDeltaNet) — uses SusonoLinearAttentionDecoderLayer
+                    # which has internal mlp_only flag to select MoE vs Dense.
                     layer_specs[i] = ModuleSpec(
                         module=SusonoLinearAttentionDecoderLayer,
-                        params={"mlp_only": mlp_only},
+                        params={"mlp_only": not use_moe},
                     )
+                else:
+                    # Full attention — uses MHCTransformerLayer. When MoE is enabled
+                    # we swap the `mlp` submodule spec to SusonoSparseMoE; otherwise
+                    # keep the original Dense MLP spec unchanged.
+                    # NOTE: use layer_specs[i] (currently holds the default full-attn
+                    # spec from whichever branch populated it) as the submodule template
+                    # — avoids relying on `base_full_attn_spec` which isn't defined in
+                    # all branches above.
+                    if use_moe:
+                        current = layer_specs[i]
+                        if (
+                            isinstance(current, ModuleSpec)
+                            and current.submodules is not None
+                            and hasattr(current.submodules, 'mlp')
+                        ):
+                            new_submodules = _dc_replace(
+                                current.submodules,
+                                mlp=ModuleSpec(module=SusonoSparseMoE),
+                            )
+                            layer_specs[i] = ModuleSpec(
+                                module=MHCTransformerLayer,
+                                submodules=new_submodules,
+                            )
+                        # else: cannot cleanly swap — fallback to existing Dense spec
+                    # (use_moe=False): keep current spec (default Dense MLP)
 
             # Update spec to use the new per-layer specs.  Carry layer_norm
             # over so the parent block keeps the final layernorm builder.

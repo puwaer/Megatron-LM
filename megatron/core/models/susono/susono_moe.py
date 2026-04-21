@@ -725,6 +725,12 @@ class SusonoSparseMoE(nn.Module):
         with torch.no_grad():
             self.shared_expert_gate.bias.fill_(gate_bias_init)
 
+    def set_layer_number(self, layer_number: int) -> None:
+        """Called by TransformerLayer after construction (see transformer_layer.py:386).
+        Propagates the layer_number to the inner router for aux-loss logging.
+        """
+        self.gate.layer_number = layer_number
+
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Sharded state dict for dist_checkpointing.
 
@@ -744,17 +750,21 @@ class SusonoSparseMoE(nn.Module):
             )
         return sharded_sd
 
-    def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+    def forward(self, hidden_states: Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
         """MoE forward pass.
 
         Args:
             hidden_states: [S, B, D]  (Megatron sequence-first).
+            **kwargs: Ignored. TransformerLayer passes extra kwargs like
+                ``padding_mask`` that the standard MLP module accepts.
+                SusonoSparseMoE doesn't use them but must accept the signature.
 
         Returns:
-            output:        [S, B, D]
-            router_logits: [T, num_experts]  — routing probability vector.
-                           Auxiliary load-balancing loss is computed and registered
-                           inside SusonoTopKRouter via save_to_aux_losses_tracker().
+            output:   [S, B, D]
+            mlp_bias: None — MoE has no output bias (matches MoELayer contract).
+                      The auxiliary load-balancing loss is computed and attached
+                      inside ``SusonoTopKRouter`` via ``MoEAuxLossAutoScaler``
+                      (gradient flows without explicit return).
         """
         S, B, D = hidden_states.shape
         x = hidden_states.reshape(-1, D)                   # [T, D]
@@ -762,7 +772,6 @@ class SusonoSparseMoE(nn.Module):
         # Shared expert (always active, sigmoid-gated)
         shared_out = self.shared_expert(x)                     # [T, D]
         # T1: Fused linear(no-bias) + bias + sigmoid + broadcast-mul.
-        # bias is added inside the Triton kernel to skip one elementwise op.
         gate_logits = F.linear(x, self.shared_expert_gate.weight)   # [T, 1]
         shared_out = fused_sigmoid_mul(
             gate_logits, shared_out,
@@ -770,11 +779,14 @@ class SusonoSparseMoE(nn.Module):
         )
 
         # Routed experts
-        router_logits, routing_weights, selected_experts = self.gate(x)
+        _router_logits, routing_weights, selected_experts = self.gate(x)
         expert_out = self.experts(x, selected_experts, routing_weights)
 
         output = (shared_out + expert_out).reshape(S, B, D)
-        return output, router_logits
+        # Return (output, bias=None) to conform to the TransformerLayer MLP contract
+        # used by MHCTransformerLayer. SusonoLinearAttentionDecoderLayer already
+        # discards the second value.
+        return output, None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
