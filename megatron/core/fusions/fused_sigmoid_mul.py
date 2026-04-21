@@ -30,7 +30,7 @@ the inputs don't satisfy the fast-path preconditions (CPU, fp64, etc.).
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -43,7 +43,11 @@ except ImportError:
     _HAVE_TRITON = False
 
 
-def _pytorch_sigmoid_mul(gate_input: Tensor, value: Tensor) -> Tensor:
+def _pytorch_sigmoid_mul(
+    gate_input: Tensor, value: Tensor, bias: Optional[Tensor] = None
+) -> Tensor:
+    if bias is not None:
+        gate_input = gate_input + bias
     return torch.sigmoid(gate_input) * value
 
 
@@ -166,6 +170,8 @@ if _HAVE_TRITON:
         gate_ptr,   # [T]    per-row scalar (post-squeeze)
         value_ptr,  # [T, D]
         out_ptr,    # [T, D]
+        bias_ptr,   # [1] scalar tensor (same dtype as gate), unused if HAS_BIAS=False
+        HAS_BIAS: tl.constexpr,
         T, D,
         BLOCK: tl.constexpr,
     ):
@@ -174,6 +180,8 @@ if _HAVE_TRITON:
             return
 
         gate = tl.load(gate_ptr + t).to(tl.float32)
+        if HAS_BIAS:
+            gate = gate + tl.load(bias_ptr).to(tl.float32)
         s = tl.sigmoid(gate)
 
         for d_blk in range(tl.cdiv(D, BLOCK)):
@@ -198,6 +206,8 @@ if _HAVE_TRITON:
         dout_ptr,   # [T, D]
         dgate_ptr,  # [T]          fp32 (accumulated scalar per row)
         dvalue_ptr, # [T, D]
+        bias_ptr,   # [1] scalar tensor, unused if HAS_BIAS=False
+        HAS_BIAS: tl.constexpr,
         T, D,
         BLOCK: tl.constexpr,
     ):
@@ -206,6 +216,8 @@ if _HAVE_TRITON:
             return
 
         gate = tl.load(gate_ptr + t).to(tl.float32)
+        if HAS_BIAS:
+            gate = gate + tl.load(bias_ptr).to(tl.float32)
         s = tl.sigmoid(gate)
         sgrad = s * (1.0 - s)  # d sigmoid / d gate
 
@@ -231,12 +243,17 @@ if _HAVE_TRITON:
 
 
     class FusedSigmoidRowGateMul(torch.autograd.Function):
-        """out = sigmoid(gate) * value, where gate is [T, 1] (per-row scalar)."""
+        """out = sigmoid(gate + bias) * value, where gate is [T, 1] (per-row scalar).
+
+        ``bias`` is an optional scalar Parameter (shape [1] or ()). When provided,
+        it is added to ``gate`` inside the kernel before ``sigmoid``, saving one
+        extra elementwise kernel vs. doing ``nn.Linear(bias=True)`` separately.
+        """
 
         @staticmethod
-        def forward(ctx, gate: Tensor, value: Tensor) -> Tensor:
-            # gate shape: [..., 1]
-            # value shape: [..., D]  with matching leading dims
+        def forward(
+            ctx, gate: Tensor, value: Tensor, bias: Optional[Tensor] = None
+        ) -> Tensor:
             assert gate.is_cuda and value.is_cuda
             assert gate.dtype == value.dtype
             assert gate.shape[-1] == 1, (
@@ -251,20 +268,28 @@ if _HAVE_TRITON:
             T, D = value_flat.shape
             out = torch.empty_like(value_flat)
 
-            BLOCK = 1024
+            has_bias = bias is not None
+            # Triton requires a pointer even when HAS_BIAS=False; pass gate_flat as dummy.
+            bias_ptr = bias.contiguous().view(-1) if has_bias else gate_flat
+
             _fused_sigmoid_row_gate_mul_fwd_kernel[(T,)](
                 gate_flat, value_flat, out,
+                bias_ptr,
+                HAS_BIAS=has_bias,
                 T=T, D=D,
             )
 
-            ctx.save_for_backward(gate_flat, value_flat)
+            ctx.save_for_backward(gate_flat, value_flat, bias_ptr if has_bias else None)
             ctx.shape_gate = gate.shape
             ctx.shape_value = value.shape
+            ctx.has_bias = has_bias
             return out.view(value.shape)
 
         @staticmethod
-        def backward(ctx, dout: Tensor) -> Tuple[Tensor, Tensor]:
-            gate_flat, value_flat = ctx.saved_tensors
+        def backward(ctx, dout: Tensor) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+            saved = ctx.saved_tensors
+            gate_flat, value_flat = saved[0], saved[1]
+            bias_ptr = saved[2] if ctx.has_bias else gate_flat
             T, D = value_flat.shape
             dout_flat = dout.contiguous().view(-1, D)
 
@@ -274,28 +299,36 @@ if _HAVE_TRITON:
             _fused_sigmoid_row_gate_mul_bwd_kernel[(T,)](
                 gate_flat, value_flat, dout_flat,
                 dgate_f32, dvalue_flat,
+                bias_ptr,
+                HAS_BIAS=ctx.has_bias,
                 T=T, D=D,
             )
 
             dgate = dgate_f32.to(gate_flat.dtype).view(ctx.shape_gate)
-            return dgate, dvalue_flat.view(ctx.shape_value)
+            # bias grad == sum(dgate) since bias is a linear shift on gate
+            dbias = dgate_f32.sum().to(gate_flat.dtype).view(1) if ctx.has_bias else None
+            return dgate, dvalue_flat.view(ctx.shape_value), dbias
 
 
-def fused_sigmoid_mul(gate_input: Tensor, value: Tensor) -> Tensor:
-    """Compute ``sigmoid(gate_input) * value`` as a single fused kernel.
+def fused_sigmoid_mul(
+    gate_input: Tensor, value: Tensor, bias: Optional[Tensor] = None
+) -> Tensor:
+    """Compute ``sigmoid(gate_input + bias) * value`` as a single fused kernel.
 
     Equivalent to::
 
-        torch.sigmoid(gate_input) * value
+        torch.sigmoid(gate_input + bias) * value   (bias treated as 0 when None)
 
-    but issues only one CUDA kernel launch for forward and one for backward,
-    down from two (sigmoid + mul) in each direction.
+    Issues one CUDA kernel launch for forward and one for backward.
+    ``bias`` is only honored for the row-gate pattern (broadcast gate).
 
     Supports two shape patterns:
-      1. ``gate_input.shape == value.shape`` — full elementwise.
+      1. ``gate_input.shape == value.shape`` — full elementwise (bias ignored,
+         falls back to PyTorch when bias given since this path has no bias kernel).
       2. ``gate_input.shape[-1] == 1`` and leading dims match — per-row scalar
          gate broadcast across the last dimension of ``value``.  This is the
-         MoE shared-expert gating pattern.
+         MoE shared-expert gating pattern; bias is a scalar added inside the
+         kernel before ``sigmoid``.
     """
     if (
         _HAVE_TRITON
@@ -304,11 +337,13 @@ def fused_sigmoid_mul(gate_input: Tensor, value: Tensor) -> Tensor:
         and gate_input.dtype == value.dtype
     ):
         if gate_input.shape == value.shape:
+            if bias is not None:
+                return _pytorch_sigmoid_mul(gate_input, value, bias)
             return FusedSigmoidMul.apply(gate_input, value)
         if (
             gate_input.dim() == value.dim()
             and gate_input.shape[-1] == 1
             and gate_input.shape[:-1] == value.shape[:-1]
         ):
-            return FusedSigmoidRowGateMul.apply(gate_input, value)
-    return _pytorch_sigmoid_mul(gate_input, value)
+            return FusedSigmoidRowGateMul.apply(gate_input, value, bias)
+    return _pytorch_sigmoid_mul(gate_input, value, bias)

@@ -66,7 +66,9 @@ except ImportError:
     LigerSiLUMulFunction = None
     _HAVE_LIGER_SWIGLU = False
 
+from megatron.core.fusions.fused_aux_loss import fused_aux_loss
 from megatron.core.fusions.fused_bias_swiglu import SwiGLUFunction, swiglu
+from megatron.core.fusions.fused_router import fused_router
 from megatron.core.fusions.fused_sigmoid_mul import fused_sigmoid_mul
 
 
@@ -180,10 +182,12 @@ class SusonoTopKRouter(nn.Module):
             routing_weights: [T, top_k]        — selected and optionally normalised weights.
             selected_experts:[T, top_k]        — expert indices (long).
         """
-        routing_probs = F.softmax(F.linear(hidden_states, self.weight), dim=-1, dtype=torch.float)
-        top_weights, top_indices = torch.topk(routing_probs, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-6)
+        # T3: Fused softmax + topk + renormalize in one Triton kernel.
+        # routing_probs is fp32 (matches original F.softmax(dtype=torch.float)).
+        logits = F.linear(hidden_states, self.weight)
+        routing_probs, top_weights, top_indices = fused_router(
+            logits, self.top_k, self.norm_topk_prob,
+        )
 
         # --- Auxiliary load-balancing loss (Switch Transformer) ---
         if (
@@ -192,16 +196,11 @@ class SusonoTopKRouter(nn.Module):
             and self.moe_aux_loss_coeff > 0
             and torch.is_grad_enabled()
         ):
-            T = hidden_states.shape[0]
-            # f_i: fraction of tokens dispatched to expert i
-            routing_map = torch.zeros_like(routing_probs)
-            routing_map.scatter_(1, top_indices, 1.0)
-            tokens_per_expert = routing_map.sum(dim=0)  # [num_experts]
-            f = tokens_per_expert / (T * self.top_k)
-            # P_i: mean routing probability for expert i
-            P = routing_probs.mean(dim=0)  # [num_experts]
-            # Switch load-balancing loss: E * sum(f_i * P_i)
-            aux_loss = self.num_experts * torch.dot(f, P) * self.moe_aux_loss_coeff
+            # T4: Fused scatter-count + mean reduction in one Triton kernel.
+            aux_loss = fused_aux_loss(
+                routing_probs, top_indices,
+                self.num_experts, self.top_k, self.moe_aux_loss_coeff,
+            )
 
             # Attach aux loss gradient to top_weights (which flows to expert
             # computation and ultimately to the loss).  routing_probs is
@@ -761,10 +760,13 @@ class SusonoSparseMoE(nn.Module):
         x = hidden_states.reshape(-1, D)                   # [T, D]
 
         # Shared expert (always active, sigmoid-gated)
-        shared_out  = self.shared_expert(x)                     # [T, D]
-        # Fused sigmoid + broadcast-mul: [T, 1] gate × [T, D] value → [T, D]
-        shared_out  = fused_sigmoid_mul(
-            self.shared_expert_gate(x), shared_out,
+        shared_out = self.shared_expert(x)                     # [T, D]
+        # T1: Fused linear(no-bias) + bias + sigmoid + broadcast-mul.
+        # bias is added inside the Triton kernel to skip one elementwise op.
+        gate_logits = F.linear(x, self.shared_expert_gate.weight)   # [T, 1]
+        shared_out = fused_sigmoid_mul(
+            gate_logits, shared_out,
+            bias=self.shared_expert_gate.bias,
         )
 
         # Routed experts
