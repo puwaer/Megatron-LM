@@ -159,8 +159,17 @@ def _load_checkpoint_impl(queue, args):
             )
             msg['dense weight']   = megatron[f'{src}.self_attention.linear_proj.weight']
             msg['post norm weight'] = megatron[f'{src}.pre_mlp_layernorm.weight']
-            msg['mlp l0 weight']  = megatron[f'{src}.mlp.linear_fc1.weight']
-            msg['mlp l1 weight']  = megatron[f'{src}.mlp.linear_fc2.weight']
+            # MLP: Dense (linear_fc1/linear_fc2) or MoE (mlp.* passthrough).
+            fc1_key = f'{src}.mlp.linear_fc1.weight'
+            if fc1_key in megatron:
+                msg['mlp l0 weight']  = megatron[fc1_key]
+                msg['mlp l1 weight']  = megatron[f'{src}.mlp.linear_fc2.weight']
+            else:
+                # MoE: pass through all mlp.* keys as-is.
+                for meg_key, val in megatron.items():
+                    if meg_key.startswith(f'{src}.mlp.'):
+                        subkey = meg_key[len(f'{src}.mlp.'):]
+                        msg[f'mlp.{subkey}'] = val
             q_norm_key = f'{src}.self_attention.q_layernorm.weight'
             k_norm_key = f'{src}.self_attention.k_layernorm.weight'
             if q_norm_key in megatron:

@@ -147,12 +147,19 @@ def _save_checkpoint_impl(queue, args):
             if 'k layernorm weight' in msg:
                 hf[f'{dst}.self_attn.k_norm.weight'] = msg['k layernorm weight']
 
-            # SwiGLU 分割 (linear_fc1 → gate_proj + up_proj)
-            fc1  = msg['mlp l0 weight']
-            gate, up = torch.chunk(fc1, 2, dim=0)
-            hf[f'{dst}.mlp.gate_proj.weight'] = gate.contiguous()
-            hf[f'{dst}.mlp.up_proj.weight']   = up.contiguous()
-            hf[f'{dst}.mlp.down_proj.weight']  = msg['mlp l1 weight']
+            # MLP: Dense (SwiGLU split) or MoE (mlp.* passthrough).
+            if 'mlp l0 weight' in msg:
+                # Dense SwiGLU: split linear_fc1 → gate_proj + up_proj
+                fc1  = msg['mlp l0 weight']
+                gate_m, up_m = torch.chunk(fc1, 2, dim=0)
+                hf[f'{dst}.mlp.gate_proj.weight'] = gate_m.contiguous()
+                hf[f'{dst}.mlp.up_proj.weight']   = up_m.contiguous()
+                hf[f'{dst}.mlp.down_proj.weight']  = msg['mlp l1 weight']
+            else:
+                # MoE: pass through all mlp.* keys as-is.
+                for key, val in msg.items():
+                    if key.startswith('mlp.'):
+                        hf[f'{dst}.{key}'] = val
 
         else:
             # --- Linear Attention 層 ---

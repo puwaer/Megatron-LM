@@ -108,8 +108,16 @@ def _save_checkpoint_impl(queue, args):
             state_dict[f'{pfx}.self_attention.linear_qkv.layer_norm_weight']      = msg['qkv layer norm weight']
             state_dict[f'{pfx}.self_attention.linear_proj.weight']                = msg['dense weight']
             state_dict[f'{pfx}.pre_mlp_layernorm.weight']                         = msg['post norm weight']
-            state_dict[f'{pfx}.mlp.linear_fc1.weight']                            = msg['mlp l0 weight']
-            state_dict[f'{pfx}.mlp.linear_fc2.weight']                            = msg['mlp l1 weight']
+            # MLP: Dense (linear_fc1/linear_fc2) or MoE (mlp.* passthrough).
+            # Detect by presence of 'mlp l0 weight'.
+            if 'mlp l0 weight' in msg:
+                state_dict[f'{pfx}.mlp.linear_fc1.weight']                        = msg['mlp l0 weight']
+                state_dict[f'{pfx}.mlp.linear_fc2.weight']                        = msg['mlp l1 weight']
+            else:
+                # MoE: pass through all mlp.* keys as-is.
+                for key, val in msg.items():
+                    if key.startswith('mlp.'):
+                        state_dict[f'{pfx}.{key}'] = val
             # QK LayerNorm (Qwen3-Next-style per-head RMSNorm, optional)
             if 'q layernorm weight' in msg:
                 state_dict[f'{pfx}.self_attention.q_layernorm.weight'] = msg['q layernorm weight']

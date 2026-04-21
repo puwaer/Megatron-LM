@@ -66,7 +66,9 @@ except ImportError:
     LigerSiLUMulFunction = None
     _HAVE_LIGER_SWIGLU = False
 
+from megatron.core.fusions.fused_aux_loss import fused_aux_loss
 from megatron.core.fusions.fused_bias_swiglu import SwiGLUFunction, swiglu
+from megatron.core.fusions.fused_router import fused_router
 from megatron.core.fusions.fused_sigmoid_mul import fused_sigmoid_mul
 
 
@@ -180,10 +182,12 @@ class SusonoTopKRouter(nn.Module):
             routing_weights: [T, top_k]        — selected and optionally normalised weights.
             selected_experts:[T, top_k]        — expert indices (long).
         """
-        routing_probs = F.softmax(F.linear(hidden_states, self.weight), dim=-1, dtype=torch.float)
-        top_weights, top_indices = torch.topk(routing_probs, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-6)
+        # T3: Fused softmax + topk + renormalize in one Triton kernel.
+        # routing_probs is fp32 (matches original F.softmax(dtype=torch.float)).
+        logits = F.linear(hidden_states, self.weight)
+        routing_probs, top_weights, top_indices = fused_router(
+            logits, self.top_k, self.norm_topk_prob,
+        )
 
         # --- Auxiliary load-balancing loss (Switch Transformer) ---
         if (
@@ -192,16 +196,11 @@ class SusonoTopKRouter(nn.Module):
             and self.moe_aux_loss_coeff > 0
             and torch.is_grad_enabled()
         ):
-            T = hidden_states.shape[0]
-            # f_i: fraction of tokens dispatched to expert i
-            routing_map = torch.zeros_like(routing_probs)
-            routing_map.scatter_(1, top_indices, 1.0)
-            tokens_per_expert = routing_map.sum(dim=0)  # [num_experts]
-            f = tokens_per_expert / (T * self.top_k)
-            # P_i: mean routing probability for expert i
-            P = routing_probs.mean(dim=0)  # [num_experts]
-            # Switch load-balancing loss: E * sum(f_i * P_i)
-            aux_loss = self.num_experts * torch.dot(f, P) * self.moe_aux_loss_coeff
+            # T4: Fused scatter-count + mean reduction in one Triton kernel.
+            aux_loss = fused_aux_loss(
+                routing_probs, top_indices,
+                self.num_experts, self.top_k, self.moe_aux_loss_coeff,
+            )
 
             # Attach aux loss gradient to top_weights (which flows to expert
             # computation and ultimately to the loss).  routing_probs is
@@ -576,9 +575,14 @@ class SusonoRoutedExperts(nn.Module):
         flat_ids_s = flat_ids[sort_idx]   # local ids == global ids when EP=1
         flat_w_s = flat_w[sort_idx]
 
+        # Defensive: clamp any out-of-range expert id (can happen rarely when
+        # the fused_router Triton kernel hits NaN / tie edge cases and returns
+        # an index in the E_BLOCK padding region [num_experts, next_pow2(num_experts))).
+        flat_ids_s = flat_ids_s.clamp_(0, self.num_local_experts - 1)
+
         tokens_per_expert = torch.bincount(
             flat_ids_s, minlength=self.num_local_experts
-        ).to(dtype=torch.int64, device='cpu')
+        )[: self.num_local_experts].to(dtype=torch.int64, device='cpu')
 
         out_sorted = self._compute_local(flat_x_s, flat_ids_s, flat_w_s, tokens_per_expert)
 
@@ -642,9 +646,14 @@ class SusonoRoutedExperts(nn.Module):
         local_ids_s = local_ids[local_sort_idx]
         recv_w_s   = recv_w[local_sort_idx]
 
+        # Defensive: clamp out-of-range local expert ids (mirror of EP=1 path).
+        # Negative values (recv_ids < local_expert_offset) or ids >= num_local_experts
+        # would break bincount; clamp keeps size == num_local_experts.
+        local_ids_safe = local_ids_s.to(torch.long).clamp_(0, self.num_local_experts - 1)
+
         tokens_per_expert = torch.bincount(
-            local_ids_s.to(torch.long), minlength=self.num_local_experts
-        ).to(dtype=torch.int64, device='cpu')
+            local_ids_safe, minlength=self.num_local_experts
+        )[: self.num_local_experts].to(dtype=torch.int64, device='cpu')
 
         # ── 6. Expert computation (GroupedGEMM or loop) ───────────────
         local_out_s = self._compute_local(
@@ -726,6 +735,12 @@ class SusonoSparseMoE(nn.Module):
         with torch.no_grad():
             self.shared_expert_gate.bias.fill_(gate_bias_init)
 
+    def set_layer_number(self, layer_number: int) -> None:
+        """Called by TransformerLayer after construction (see transformer_layer.py:386).
+        Propagates the layer_number to the inner router for aux-loss logging.
+        """
+        self.gate.layer_number = layer_number
+
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Sharded state dict for dist_checkpointing.
 
@@ -745,34 +760,43 @@ class SusonoSparseMoE(nn.Module):
             )
         return sharded_sd
 
-    def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+    def forward(self, hidden_states: Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
         """MoE forward pass.
 
         Args:
             hidden_states: [S, B, D]  (Megatron sequence-first).
+            **kwargs: Ignored. TransformerLayer passes extra kwargs like
+                ``padding_mask`` that the standard MLP module accepts.
+                SusonoSparseMoE doesn't use them but must accept the signature.
 
         Returns:
-            output:        [S, B, D]
-            router_logits: [T, num_experts]  — routing probability vector.
-                           Auxiliary load-balancing loss is computed and registered
-                           inside SusonoTopKRouter via save_to_aux_losses_tracker().
+            output:   [S, B, D]
+            mlp_bias: None — MoE has no output bias (matches MoELayer contract).
+                      The auxiliary load-balancing loss is computed and attached
+                      inside ``SusonoTopKRouter`` via ``MoEAuxLossAutoScaler``
+                      (gradient flows without explicit return).
         """
         S, B, D = hidden_states.shape
         x = hidden_states.reshape(-1, D)                   # [T, D]
 
         # Shared expert (always active, sigmoid-gated)
-        shared_out  = self.shared_expert(x)                     # [T, D]
-        # Fused sigmoid + broadcast-mul: [T, 1] gate × [T, D] value → [T, D]
-        shared_out  = fused_sigmoid_mul(
-            self.shared_expert_gate(x), shared_out,
+        shared_out = self.shared_expert(x)                     # [T, D]
+        # T1: Fused linear(no-bias) + bias + sigmoid + broadcast-mul.
+        gate_logits = F.linear(x, self.shared_expert_gate.weight)   # [T, 1]
+        shared_out = fused_sigmoid_mul(
+            gate_logits, shared_out,
+            bias=self.shared_expert_gate.bias,
         )
 
         # Routed experts
-        router_logits, routing_weights, selected_experts = self.gate(x)
+        _router_logits, routing_weights, selected_experts = self.gate(x)
         expert_out = self.experts(x, selected_experts, routing_weights)
 
         output = (shared_out + expert_out).reshape(S, B, D)
-        return output, router_logits
+        # Return (output, bias=None) to conform to the TransformerLayer MLP contract
+        # used by MHCTransformerLayer. SusonoLinearAttentionDecoderLayer already
+        # discards the second value.
+        return output, None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
