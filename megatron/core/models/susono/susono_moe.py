@@ -575,9 +575,14 @@ class SusonoRoutedExperts(nn.Module):
         flat_ids_s = flat_ids[sort_idx]   # local ids == global ids when EP=1
         flat_w_s = flat_w[sort_idx]
 
+        # Defensive: clamp any out-of-range expert id (can happen rarely when
+        # the fused_router Triton kernel hits NaN / tie edge cases and returns
+        # an index in the E_BLOCK padding region [num_experts, next_pow2(num_experts))).
+        flat_ids_s = flat_ids_s.clamp_(0, self.num_local_experts - 1)
+
         tokens_per_expert = torch.bincount(
             flat_ids_s, minlength=self.num_local_experts
-        ).to(dtype=torch.int64, device='cpu')
+        )[: self.num_local_experts].to(dtype=torch.int64, device='cpu')
 
         out_sorted = self._compute_local(flat_x_s, flat_ids_s, flat_w_s, tokens_per_expert)
 
@@ -641,9 +646,14 @@ class SusonoRoutedExperts(nn.Module):
         local_ids_s = local_ids[local_sort_idx]
         recv_w_s   = recv_w[local_sort_idx]
 
+        # Defensive: clamp out-of-range local expert ids (mirror of EP=1 path).
+        # Negative values (recv_ids < local_expert_offset) or ids >= num_local_experts
+        # would break bincount; clamp keeps size == num_local_experts.
+        local_ids_safe = local_ids_s.to(torch.long).clamp_(0, self.num_local_experts - 1)
+
         tokens_per_expert = torch.bincount(
-            local_ids_s.to(torch.long), minlength=self.num_local_experts
-        ).to(dtype=torch.int64, device='cpu')
+            local_ids_safe, minlength=self.num_local_experts
+        )[: self.num_local_experts].to(dtype=torch.int64, device='cpu')
 
         # ── 6. Expert computation (GroupedGEMM or loop) ───────────────
         local_out_s = self._compute_local(

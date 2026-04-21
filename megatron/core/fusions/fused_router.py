@@ -96,11 +96,19 @@ if _HAVE_TRITON:
         )
 
         # Top-K via iterative argmax + masking (K small, unrolled)
-        p_work = tl.where(mask, p, -float('inf'))
+        # NaN sanitization: NaN != NaN is true in IEEE 754, so this replaces NaNs with -inf.
+        # Without this, argmax over a vector containing NaN has undefined semantics and may
+        # return an index in the E_BLOCK padding region (>= E), which breaks downstream bincount.
+        p_safe = tl.where(p == p, p, -float('inf'))
+        p_work = tl.where(mask, p_safe, -float('inf'))
         top_sum = tl.zeros([], dtype=tl.float32)
         for k in tl.static_range(K):
+            # Idempotent re-mask on every iteration as a belt-and-braces guard.
+            p_work = tl.where(mask, p_work, -float('inf'))
             val = tl.max(p_work, axis=0)
             idx = tl.argmax(p_work, axis=0).to(tl.int64)
+            # Hard clamp: even if argmax somehow returns OOB, force idx into [0, E).
+            idx = tl.minimum(idx, tl.full([], E - 1, tl.int64))
             tl.store(top_w_ptr + t * K + k, val.to(top_w_ptr.dtype.element_ty))
             tl.store(top_idx_ptr + t * K + k, idx)
             p_work = tl.where(offs == idx, -float('inf'), p_work)
