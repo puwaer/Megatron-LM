@@ -390,6 +390,13 @@ class CheckpointConfig:
     """Load model for finetuning. Do not load optimizer or rng state from checkpoint and set iteration to 0.
     Assumed when loading a release checkpoint."""
 
+    reset_iteration: bool = field(
+        default=False,
+        metadata={"argparse_meta": {"arg_names": ["--reset-iteration"]}},
+    )
+    """Reset iteration / consumed_samples / FLOPs counters to 0 after checkpoint load.
+    Unlike --finetune, optimizer state is still loaded (unless --no-load-optim is also set)."""
+
     pretrained_checkpoint: str | None = None
     """Directory containing a pretrained model checkpoint for finetuning."""
 
