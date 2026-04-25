@@ -7,7 +7,21 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.optim import SGD as CPUSGD
-from torch.optim import AdamW as CPUAdam
+from torch.optim import AdamW as _TorchCPUAdam
+
+# Prefer DeepSpeedCPUAdam on the optimizer-cpu-offload path. It runs an
+# AVX-512 / ARM-SVE2 fused kernel and (with fp32_optimizer_states=True, the
+# default) keeps exp_avg / exp_avg_sq in fp32 regardless of the parameter
+# dtype, so updates are computed in fp32 even for bf16 params. This is the
+# precision behavior pure torch.optim.AdamW lacks. Falls back to
+# torch.optim.AdamW if `deepspeed` isn't installed in the runtime image.
+try:
+    from deepspeed.ops.adam import DeepSpeedCPUAdam as CPUAdam
+
+    _CPU_ADAM_BACKEND = "deepspeed"
+except ImportError:
+    CPUAdam = _TorchCPUAdam
+    _CPU_ADAM_BACKEND = "torch"
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -325,7 +339,18 @@ def _get_megatron_optimizer_based_on_param_groups(
                     betas=(config.adam_beta1, config.adam_beta2),
                     eps=config.adam_eps,
                     bias_correction=True,
-                    fused=True,  # this flag is used to improve the performance of the cpu optimizer
+                )
+                if _CPU_ADAM_BACKEND == "torch":
+                    # torch.optim.AdamW: opt-in fused PyTorch impl.
+                    # DeepSpeedCPUAdam doesn't take a `fused` kwarg (its kernel
+                    # is always fused) and would store the key as an unused
+                    # extra in each param_group, so only pass it for torch.
+                    optimizer_defaults["fused"] = True
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"CPU-offload Adam backend: {_CPU_ADAM_BACKEND} "
+                    f"({cpu_optimizer_cls.__module__}.{cpu_optimizer_cls.__name__})",
                 )
             else:
                 gpu_optimizer_cls = SGD
