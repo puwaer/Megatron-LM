@@ -2,10 +2,17 @@
 
 """Megatron Energy Monitoring (NVML)"""
 
+import os
+
 import torch
 import torch.distributed as dist
 
+# GH200 + Singularity 環境では nvmlDeviceGetTotalEnergyConsumption が C-level segfault を
+# 起こすため (NVMLError では捕捉不可)、MEGATRON_DISABLE_ENERGY_MONITOR=1 で全面 no-op に
+# できる退避経路を持たせる。
 try:
+    if os.environ.get("MEGATRON_DISABLE_ENERGY_MONITOR", "0") == "1":
+        raise ImportError("EnergyMonitor disabled via MEGATRON_DISABLE_ENERGY_MONITOR=1")
     from pynvml import (
         NVMLError,
         nvmlDeviceGetHandleByIndex,
