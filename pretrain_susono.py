@@ -180,6 +180,83 @@ def add_susono_args(parser):
     # megatron/training/arguments.py. Re-registering them here would cause a conflict.
     return parser
 
+# save-time CPU memory diagnostics & best-effort cleanup
+# Wraps save_checkpoint to (1) log per-rank RSS and cgroup memory.current
+# before/after save and gc, (2) call gc.collect() + malloc_trim(0) so glibc
+# returns free heap chunks to the OS. Lets us see whether CPU OOM during
+# checkpoint save is reachable by simple cache flushing or whether the
+# serialization buffer is the structural cause.
+import gc as _susono_gc
+import os as _susono_os
+import ctypes as _susono_ctypes
+
+
+def _susono_read_rss_gb():
+    rss_gb = -1.0
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    rss_gb = int(line.split()[1]) / (1024 * 1024)
+                    break
+    except Exception:
+        pass
+    cgroup_gb = -1.0
+    for path in ('/sys/fs/cgroup/memory.current',
+                 '/sys/fs/cgroup/memory/memory.usage_in_bytes'):
+        try:
+            with open(path) as f:
+                cgroup_gb = int(f.read().strip()) / (1024 ** 3)
+            break
+        except Exception:
+            continue
+    return rss_gb, cgroup_gb
+
+
+try:
+    _susono_libc = _susono_ctypes.CDLL("libc.so.6")
+    _susono_has_malloc_trim = True
+except OSError:
+    _susono_libc = None
+    _susono_has_malloc_trim = False
+
+
+def _susono_log_mem(label):
+    rss, cg = _susono_read_rss_gb()
+    rank = _susono_os.environ.get('RANK', '?')
+    print(f"[susono CPUmem rank {rank}] {label}: RSS={rss:.2f}GB cgroup={cg:.2f}GB",
+          flush=True)
+
+
+def _susono_cleanup_cpu_caches():
+    _susono_gc.collect()
+    if _susono_has_malloc_trim:
+        try:
+            _susono_libc.malloc_trim(0)
+        except Exception:
+            pass
+
+
+import megatron.training.checkpointing as _susono_ckpt_mod
+import megatron.training.training as _susono_train_mod
+_susono_orig_save_checkpoint = _susono_ckpt_mod.save_checkpoint
+
+
+def _susono_wrapped_save_checkpoint(iteration, *args, **kwargs):
+    _susono_log_mem(f"BEFORE save iter {iteration}")
+    _susono_cleanup_cpu_caches()
+    _susono_log_mem(f"BEFORE save iter {iteration} (after gc+malloc_trim)")
+    try:
+        return _susono_orig_save_checkpoint(iteration, *args, **kwargs)
+    finally:
+        _susono_log_mem(f"AFTER save iter {iteration}")
+        _susono_cleanup_cpu_caches()
+        _susono_log_mem(f"AFTER save iter {iteration} (after gc+malloc_trim)")
+
+
+_susono_ckpt_mod.save_checkpoint = _susono_wrapped_save_checkpoint
+_susono_train_mod.save_checkpoint = _susono_wrapped_save_checkpoint
+
 if __name__ == "__main__":
     pretrain(
         train_valid_test_datasets_provider,
