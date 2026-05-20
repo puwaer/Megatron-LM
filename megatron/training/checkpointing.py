@@ -1823,11 +1823,19 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                                                update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
 
             # Load scheduler.
-            if opt_param_scheduler is not None:
+            # Why: even with --override-opt_param-scheduler, load_state_dict still calls
+            #   self.step(increment=num_steps_from_ckpt), which inherits the LR-decay
+            #   position from the previous run. With --reset-iteration the intent is a
+            #   fresh start of training counters, so the scheduler's num_steps must also
+            #   restart at 0; Adam moments are loaded above and are unaffected.
+            if opt_param_scheduler is not None and not getattr(args, 'reset_iteration', False):
                 if 'lr_scheduler' in state_dict: # backward compatbility
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+            elif opt_param_scheduler is not None:
+                print_rank_0(' > reset_iteration=True: skipping opt_param_scheduler '
+                             'state_dict load — LR schedule restarts from num_steps=0')
         except KeyError as e:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
