@@ -189,13 +189,12 @@ class LayerWiseShardedRefModel(torch.nn.Module):
         self._ref_dtype = ref_dtype
 
     def _setup_gather_buffers(self) -> None:
-        """Build per-block / per-global offset layouts and pre-allocate
-        the reusable gather buffers.
+        """Build per-block / per-global offset layouts and pre-allocate the
+        reusable gather buffers.
 
         Each param gets a distinct offset within its layout so multiple
-        params live side-by-side in the buffer rather than overwriting
-        the same prefix — that was the silent correctness bug in the
-        previous single-shared-slot design.
+        params live side-by-side in the buffer rather than overwriting the
+        same prefix.
         """
         if not self._meta:
             self._global_buf = None
@@ -242,9 +241,8 @@ class LayerWiseShardedRefModel(torch.nn.Module):
             if max_block_total > 0 else None
         )
 
-        # H2D scratch: reused param-by-param within a block; safe because
-        # the next H2D into this buffer is serialized after the previous
-        # all_gather on the same CUDA stream.
+        # H2D scratch: reused param-by-param within a block (next H2D is
+        # serialized after the previous all_gather on the same CUDA stream).
         max_shard_numel = max(shard_size for _, _, shard_size in self._meta.values())
         self._h2d_buf = (
             torch.empty(max_shard_numel, dtype=ref_dtype, device=device)

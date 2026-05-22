@@ -63,15 +63,15 @@ def get_batch(data_iterator, *, seq_length: int, eos_token_id: int,
 def get_dpo_batch(data_iterator, *, seq_length: int, eos_token_id: int,
                   reset_position_ids: bool = True,
                   reset_attention_mask: bool = True) -> Optional[Dict[str, torch.Tensor]]:
-    """Pull one preference pair and prepare the [2, S] model input.
+    """Pull one preference micro-batch and prepare the ``[2*mbs, S]`` input.
 
     Each item from the DPO dataset is a paired tensor of shape
     ``[2, seq_length + 1]`` where row 0 is the chosen and row 1 is the
-    rejected. With ``micro_batch_size = 1`` (enforced by the entry script)
-    the broadcast tensor is ``[1, 2, S+1]``; we squeeze the leading mbs
-    dimension so the effective per-step batch fed to the model is
-    ``[2, S]``. The DPO loss is responsible for chunking ref vs. policy
-    after the forward.
+    rejected. With ``micro_batch_size = mbs`` the broadcast tensor is
+    ``[mbs, 2, S+1]``; we transpose the leading two dims and flatten so
+    the first ``mbs`` rows are all chosen and the next ``mbs`` are all
+    rejected — matching the layout that :func:`dpo_loss_func` expects
+    (see ``loss.py:49-62``).
     """
     if data_iterator is not None:
         data = next(data_iterator)
@@ -80,13 +80,19 @@ def get_dpo_batch(data_iterator, *, seq_length: int, eos_token_id: int,
 
     data_b = _broadcast_to_tp(data, seq_length)
 
-    # Expected mbs == 1. Drop the outer (mbs) dim and keep the [2, S+1] pair.
     ids = data_b["input_ids"]
-    if ids.dim() == 3:
-        ids = ids[0]
     lbl = data_b["labels"]
-    if lbl.dim() == 3:
-        lbl = lbl[0]
+    if ids.dim() == 3:
+        # ``[mbs, 2, S+1]`` -> ``[2, mbs, S+1]`` -> ``[2*mbs, S+1]``.
+        # The naive ``ids[0]`` we used to do here silently dropped every
+        # sample beyond index 0 once mbs>1, making mbs=2/4 train on only
+        # 1/mbs of the samples actually consumed by the dataloader.
+        mbs, two, sp1 = ids.shape
+        assert two == 2, (
+            f"Expected paired DPO sample [mbs, 2, S+1], got {tuple(ids.shape)}"
+        )
+        ids = ids.transpose(0, 1).contiguous().view(2 * mbs, sp1)
+        lbl = lbl.transpose(0, 1).contiguous().view(2 * mbs, sp1)
 
     tokens = ids[:, : seq_length].contiguous()
     labels = lbl[:, 1 : seq_length + 1].contiguous()
