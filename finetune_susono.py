@@ -43,17 +43,13 @@ def train_valid_test_datasets_provider(num_samples_train_val_test):
     args = get_args()
     print_rank_0("> building Susono SFT datasets ...")
     tokenizer = get_tokenizer()
-    hf_tokenizer = getattr(tokenizer, "_tokenizer", None)
+    library_wrapper = getattr(tokenizer, "_tokenizer", None)
+    hf_tokenizer = getattr(library_wrapper, "tokenizer", None)
     if not isinstance(hf_tokenizer, transformers.PreTrainedTokenizerBase):
         raise ValueError(
             "Susono SFT requires --tokenizer-type HuggingFaceTokenizer "
             "(underlying object must be transformers.PreTrainedTokenizerBase)."
         )
-    if args.micro_batch_size != 1:
-        raise ValueError(
-            "Susono SFT enforces --micro-batch-size 1 (samples are pre-packed)."
-        )
-
     shard_world = mpu.get_expert_data_parallel_world_size()
     shard_index = mpu.get_expert_data_parallel_rank()
     train_ds, valid_ds, test_ds = build_sft_train_valid_test(
@@ -73,7 +69,7 @@ def forward_step(data_iterator, model):
 
     timers("batch-generator", log_level=2).start()
     tokenizer = get_tokenizer()
-    eos_id = int(tokenizer._tokenizer.eos_token_id)
+    eos_id = int(tokenizer.eos_id)
     batch = get_batch(
         data_iterator,
         seq_length=args.seq_length,
