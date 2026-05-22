@@ -10,6 +10,7 @@ This mirrors the design in ms-swift's ``MegatronRLHFTrainer.prepare_model`` /
 ``null_ref_context`` (``swift/megatron/trainers/rlhf_mixin.py:29-70``) but
 without depending on swift's bridge or its trainer harness.
 """
+import warnings
 from contextlib import contextmanager
 from typing import List, Optional
 
@@ -137,15 +138,25 @@ class LayerWiseShardedRefModel(torch.nn.Module):
             p for _, p in ref_model.named_parameters()
             if id(p) in self._meta and id(p) not in block_param_ids
         ]
-        for blk in self._blocks:
-            blk.register_forward_pre_hook(self._make_pre(blk))
-            blk.register_forward_hook(self._make_post(blk))
+        self._setup_gather_buffers()
+        for block_idx, blk in enumerate(self._blocks):
+            blk.register_forward_pre_hook(self._make_pre(block_idx))
+            blk.register_forward_hook(self._make_post(block_idx))
 
     def _partition_all(self) -> None:
+        ref_dtype = None
         for _, p in self._ref.named_parameters():
             full_numel = p.numel()
             if full_numel == 0:
                 continue
+            if ref_dtype is None:
+                ref_dtype = p.dtype
+            elif ref_dtype != p.dtype:
+                raise AssertionError(
+                    f"LayerWiseShardedRefModel assumes all ref params share dtype "
+                    f"(got {ref_dtype} and {p.dtype}); the shared gather buffer "
+                    f"design needs a per-dtype extension to support mixed dtypes."
+                )
             shard_size = (full_numel + self._world - 1) // self._world
             start = self._rank * shard_size
             end = min(start + shard_size, full_numel)
@@ -156,47 +167,137 @@ class LayerWiseShardedRefModel(torch.nn.Module):
                 )
             if not self._cpu:
                 shard = shard.to(p.device)
+            else:
+                # Page-lock so async H2D copy via NVLink-C2C uses DMA at full
+                # bandwidth. Fall back silently to pageable if pin fails (e.g.
+                # kernel rejects locking that much memory).
+                try:
+                    shard = shard.pin_memory()
+                except RuntimeError as exc:
+                    if self._rank == 0:
+                        warnings.warn(
+                            f"[Susono DPO] pin_memory() failed on ref shard "
+                            f"(numel={shard_size}): {exc}; falling back to "
+                            f"pageable memory (H2D will be synchronous)."
+                        )
             self._shards[id(p)] = shard
             self._meta[id(p)] = (p.shape, full_numel, shard_size)
             p.data = torch.empty(0, dtype=p.dtype, device=p.device)
 
-    def _gather_one(self, p) -> None:
+        # ``_ref_dtype`` and per-shard sizes are needed later by
+        # ``_setup_gather_buffers``; stash them here.
+        self._ref_dtype = ref_dtype
+
+    def _setup_gather_buffers(self) -> None:
+        """Build per-block / per-global offset layouts and pre-allocate
+        the reusable gather buffers.
+
+        Each param gets a distinct offset within its layout so multiple
+        params live side-by-side in the buffer rather than overwriting
+        the same prefix — that was the silent correctness bug in the
+        previous single-shared-slot design.
+        """
+        if not self._meta:
+            self._global_buf = None
+            self._block_buf = None
+            self._h2d_buf = None
+            self._global_offsets = {}
+            self._block_layouts = [{} for _ in self._blocks]
+            return
+
+        device = torch.cuda.current_device()
+        ref_dtype = self._ref_dtype
+
+        # Globals: persistent buffer, fixed offsets.
+        self._global_offsets = {}
+        global_total = 0
+        for p in self._global_params:
+            shard_size = self._meta[id(p)][2]
+            gathered = shard_size * self._world
+            self._global_offsets[id(p)] = global_total
+            global_total += gathered
+        self._global_buf = (
+            torch.empty(global_total, dtype=ref_dtype, device=device)
+            if global_total > 0 else None
+        )
+
+        # Per-block layouts. Block buffer is reused across blocks (post_hook
+        # releases all params before the next block's pre_hook overwrites).
+        self._block_layouts = []
+        max_block_total = 0
+        for blk in self._blocks:
+            layout = {}
+            cur = 0
+            for p in blk.parameters():
+                if id(p) not in self._meta:
+                    continue
+                shard_size = self._meta[id(p)][2]
+                gathered = shard_size * self._world
+                layout[id(p)] = cur
+                cur += gathered
+            max_block_total = max(max_block_total, cur)
+            self._block_layouts.append(layout)
+        self._block_buf = (
+            torch.empty(max_block_total, dtype=ref_dtype, device=device)
+            if max_block_total > 0 else None
+        )
+
+        # H2D scratch: reused param-by-param within a block; safe because
+        # the next H2D into this buffer is serialized after the previous
+        # all_gather on the same CUDA stream.
+        max_shard_numel = max(shard_size for _, _, shard_size in self._meta.values())
+        self._h2d_buf = (
+            torch.empty(max_shard_numel, dtype=ref_dtype, device=device)
+            if self._cpu else None
+        )
+
+    def _gather_one(self, p, buf, offset_in_buf) -> None:
         if id(p) not in self._meta:
             return
         shape, full_numel, shard_size = self._meta[id(p)]
         shard = self._shards[id(p)]
-        device = torch.cuda.current_device()
-        shard_gpu = shard.to(device, non_blocking=False) if shard.is_cpu else shard
-        if self._world == 1:
-            p.data = shard_gpu[:full_numel].view(shape)
+        if shard.is_cpu:
+            # H2D into the pre-allocated scratch (async DMA when shard is pinned).
+            h2d_view = self._h2d_buf[:shard_size]
+            h2d_view.copy_(shard, non_blocking=True)
+            shard_gpu = h2d_view
         else:
-            buf = torch.empty(
-                shard_size * self._world, dtype=p.dtype, device=device
+            shard_gpu = shard
+
+        gathered_numel = shard_size * self._world
+        buf_view = buf[offset_in_buf : offset_in_buf + gathered_numel]
+        if self._world == 1:
+            buf_view[:shard_size].copy_(shard_gpu)
+        else:
+            torch.distributed.all_gather_into_tensor(
+                buf_view, shard_gpu, group=self._group
             )
-            torch.distributed.all_gather_into_tensor(buf, shard_gpu, group=self._group)
-            p.data = buf[:full_numel].view(shape)
+        p.data = buf_view[:full_numel].view(shape)
 
     def _release_one(self, p) -> None:
         if id(p) in self._meta:
             p.data = torch.empty(0, dtype=p.dtype, device=p.device)
 
-    def _make_pre(self, block):
+    def _make_pre(self, block_idx):
         def hook(module, args):
-            for p in block.parameters():
-                self._gather_one(p)
+            layout = self._block_layouts[block_idx]
+            for p in self._blocks[block_idx].parameters():
+                if id(p) in self._meta:
+                    self._gather_one(p, self._block_buf, layout[id(p)])
             return None
         return hook
 
-    def _make_post(self, block):
+    def _make_post(self, block_idx):
         def hook(module, args, output):
-            for p in block.parameters():
+            for p in self._blocks[block_idx].parameters():
                 self._release_one(p)
             return None
         return hook
 
     def forward(self, *args, **kwargs):
-        for p in self._global_params:
-            self._gather_one(p)
+        if self._global_buf is not None:
+            for p in self._global_params:
+                self._gather_one(p, self._global_buf, self._global_offsets[id(p)])
         try:
             with torch.no_grad():
                 return self._ref(*args, **kwargs)
