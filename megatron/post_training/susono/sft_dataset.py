@@ -90,18 +90,25 @@ class SusonoSFTDataset(torch.utils.data.Dataset):
         if tokenizer.chat_template is None:
             raise ValueError("Tokenizer has no chat_template; cannot apply SFT formatting.")
 
-        from datasets import load_dataset
+        from datasets import load_dataset, load_from_disk
 
         self.num_packed_samples = num_packed_samples
         self.tokenizer = tokenizer
         self.seq_length = seq_length
         self.num_shards = num_shards
         self.shard_index = shard_index
-        self._raw_samples = load_dataset(
-            hf_dataset,
-            split=split,
-            token=os.environ.get("HF_TOKEN", None),
-        )
+        if os.path.isdir(hf_dataset) and os.path.exists(
+            os.path.join(hf_dataset, "dataset_info.json")
+        ):
+            self._raw_samples = load_from_disk(hf_dataset)
+            if hasattr(self._raw_samples, "keys") and split in self._raw_samples:
+                self._raw_samples = self._raw_samples[split]
+        else:
+            self._raw_samples = load_dataset(
+                hf_dataset,
+                split=split,
+                token=os.environ.get("HF_TOKEN", None),
+            )
         if num_shards > 1:
             self._raw_samples = self._raw_samples.shard(
                 num_shards=num_shards, index=shard_index

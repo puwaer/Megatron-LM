@@ -110,7 +110,7 @@ class SusonoDPOPreferenceDataset(torch.utils.data.Dataset):
             # Falling back to eos as pad is the standard HF idiom for causal LMs.
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        from datasets import load_dataset
+        from datasets import load_dataset, load_from_disk
 
         self.num_samples = num_samples
         self.tokenizer = tokenizer
@@ -119,11 +119,18 @@ class SusonoDPOPreferenceDataset(torch.utils.data.Dataset):
         self.shard_index = shard_index
         self._eos = int(tokenizer.eos_token_id)
         self._pad = int(tokenizer.pad_token_id)
-        self._raw = load_dataset(
-            hf_dataset,
-            split=split,
-            token=os.environ.get("HF_TOKEN", None),
-        )
+        if os.path.isdir(hf_dataset) and os.path.exists(
+            os.path.join(hf_dataset, "dataset_info.json")
+        ):
+            self._raw = load_from_disk(hf_dataset)
+            if hasattr(self._raw, "keys") and split in self._raw:
+                self._raw = self._raw[split]
+        else:
+            self._raw = load_dataset(
+                hf_dataset,
+                split=split,
+                token=os.environ.get("HF_TOKEN", None),
+            )
         if num_shards > 1:
             self._raw = self._raw.shard(num_shards=num_shards, index=shard_index)
 
