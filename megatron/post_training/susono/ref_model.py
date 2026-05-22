@@ -25,6 +25,225 @@ from megatron.training.training import get_model
 _REF_MODELS: Optional[List[torch.nn.Module]] = None
 
 
+class ShardedRefModel(torch.nn.Module):
+    """ZeRO-3 style DP sharding for a frozen ref model.
+
+    Each rank holds 1/world_size of every nn.Parameter (where world_size is
+    the size of ``shard_group``). Just before forward, params are all-gathered
+    into their original shapes; the gathered tensors are released after
+    forward returns so the steady-state footprint is the per-rank shard only.
+    """
+
+    def __init__(self, ref_model: torch.nn.Module, shard_group):
+        super().__init__()
+        self._ref = ref_model
+        self._group = shard_group
+        self._world = torch.distributed.get_world_size(shard_group)
+        self._rank = torch.distributed.get_rank(shard_group)
+        self._shards = {}
+        self._meta = {}
+        self._partition()
+
+    def _partition(self) -> None:
+        for name, p in self._ref.named_parameters():
+            full_numel = p.numel()
+            if full_numel == 0:
+                continue
+            shard_size = (full_numel + self._world - 1) // self._world
+            start = self._rank * shard_size
+            end = min(start + shard_size, full_numel)
+            flat = p.data.contiguous().view(-1)
+            shard = torch.empty(shard_size, dtype=p.dtype, device=p.device)
+            if end > start:
+                shard[: end - start].copy_(flat[start:end])
+            if end - start < shard_size:
+                shard[end - start :].zero_()
+            self._shards[name] = shard
+            self._meta[name] = (p.shape, full_numel)
+            p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+
+    def _gather(self) -> None:
+        for name, p in self._ref.named_parameters():
+            if name not in self._meta:
+                continue
+            shape, full_numel = self._meta[name]
+            shard = self._shards[name]
+            buf = torch.empty(
+                shard.numel() * self._world, dtype=shard.dtype, device=shard.device
+            )
+            torch.distributed.all_gather_into_tensor(buf, shard, group=self._group)
+            p.data = buf[:full_numel].view(shape)
+
+    def _release(self) -> None:
+        for _, p in self._ref.named_parameters():
+            p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+
+    def forward(self, *args, **kwargs):
+        self._gather()
+        try:
+            with torch.no_grad():
+                return self._ref(*args, **kwargs)
+        finally:
+            self._release()
+
+    def set_input_tensor(self, input_tensor) -> None:
+        self._ref.set_input_tensor(input_tensor)
+
+
+class LayerWiseShardedRefModel(torch.nn.Module):
+    """FSDP-style layer-wise sharded ref model.
+
+    Each parameter is sharded across ``shard_group`` and held either on CPU
+    (``cpu_offload=True``) or GPU. Forward hooks on every entry of
+    ``ref_model.decoder.layers`` all-gather just that layer's params before
+    the layer runs and release them right after. Non-layer params (embed,
+    final norm, output projection) are gathered once at outer forward entry
+    and released at outer exit. Peak gathered GPU memory during ref forward
+    is roughly one transformer layer worth (~ full_size / num_layers).
+    """
+
+    def __init__(self, ref_model: torch.nn.Module, shard_group, cpu_offload: bool = False):
+        super().__init__()
+        self._ref = ref_model
+        self._group = shard_group
+        if shard_group is None:
+            self._world = 1
+            self._rank = 0
+        else:
+            self._world = torch.distributed.get_world_size(shard_group)
+            self._rank = torch.distributed.get_rank(shard_group)
+        self._cpu = cpu_offload
+        self._shards = {}    # id(param) -> 1D shard tensor (CPU or GPU)
+        self._meta = {}      # id(param) -> (shape, full_numel, shard_size)
+        self._partition_all()
+
+        # Unwrap Megatron wrappers (Float16Module is added unconditionally
+        # under --bf16/--fp16) to reach the underlying model with decoder.layers.
+        inner = ref_model
+        for _ in range(5):
+            if hasattr(inner, "decoder") and hasattr(getattr(inner, "decoder"), "layers"):
+                break
+            if hasattr(inner, "module"):
+                inner = inner.module
+            else:
+                break
+        assert hasattr(inner, "decoder") and hasattr(inner.decoder, "layers"), (
+            "LayerWiseShardedRefModel could not locate decoder.layers on the ref "
+            "model (checked up to 5 wrapper levels)."
+        )
+        self._blocks = list(inner.decoder.layers)
+        block_param_ids = {id(p) for blk in self._blocks for p in blk.parameters()}
+        self._global_params = [
+            p for _, p in ref_model.named_parameters()
+            if id(p) in self._meta and id(p) not in block_param_ids
+        ]
+        for blk in self._blocks:
+            blk.register_forward_pre_hook(self._make_pre(blk))
+            blk.register_forward_hook(self._make_post(blk))
+
+    def _partition_all(self) -> None:
+        for _, p in self._ref.named_parameters():
+            full_numel = p.numel()
+            if full_numel == 0:
+                continue
+            shard_size = (full_numel + self._world - 1) // self._world
+            start = self._rank * shard_size
+            end = min(start + shard_size, full_numel)
+            shard = torch.zeros(shard_size, dtype=p.dtype, device="cpu")
+            if end > start:
+                shard[: end - start].copy_(
+                    p.data.detach().contiguous().view(-1)[start:end].cpu()
+                )
+            if not self._cpu:
+                shard = shard.to(p.device)
+            self._shards[id(p)] = shard
+            self._meta[id(p)] = (p.shape, full_numel, shard_size)
+            p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+
+    def _gather_one(self, p) -> None:
+        if id(p) not in self._meta:
+            return
+        shape, full_numel, shard_size = self._meta[id(p)]
+        shard = self._shards[id(p)]
+        device = torch.cuda.current_device()
+        shard_gpu = shard.to(device, non_blocking=False) if shard.is_cpu else shard
+        if self._world == 1:
+            p.data = shard_gpu[:full_numel].view(shape)
+        else:
+            buf = torch.empty(
+                shard_size * self._world, dtype=p.dtype, device=device
+            )
+            torch.distributed.all_gather_into_tensor(buf, shard_gpu, group=self._group)
+            p.data = buf[:full_numel].view(shape)
+
+    def _release_one(self, p) -> None:
+        if id(p) in self._meta:
+            p.data = torch.empty(0, dtype=p.dtype, device=p.device)
+
+    def _make_pre(self, block):
+        def hook(module, args):
+            for p in block.parameters():
+                self._gather_one(p)
+            return None
+        return hook
+
+    def _make_post(self, block):
+        def hook(module, args, output):
+            for p in block.parameters():
+                self._release_one(p)
+            return None
+        return hook
+
+    def forward(self, *args, **kwargs):
+        for p in self._global_params:
+            self._gather_one(p)
+        try:
+            with torch.no_grad():
+                return self._ref(*args, **kwargs)
+        finally:
+            for p in self._global_params:
+                self._release_one(p)
+
+    def set_input_tensor(self, input_tensor) -> None:
+        self._ref.set_input_tensor(input_tensor)
+
+
+def _get_ref_shard_group(args):
+    """Resolve the ProcessGroup used to shard ref params.
+
+    Returns ``None`` when sharding is disabled (``--ref-shard-size 1``).
+    Reuses Megatron's intra-instance DP group when the user-specified shard
+    size matches ``DP_SIZE / num_distributed_optimizer_instances``.
+    """
+    shard_size = args.ref_shard_size
+    dp_size = mpu.get_data_parallel_world_size()
+    opt_n = getattr(args, "num_distributed_optimizer_instances", 1) or 1
+    intra_policy_size = dp_size // opt_n
+
+    if dp_size % shard_size != 0:
+        raise ValueError(
+            f"DP size {dp_size} must be divisible by --ref-shard-size {shard_size}"
+        )
+
+    if shard_size == 1:
+        return None
+    if shard_size == dp_size:
+        return mpu.get_data_parallel_group()
+    if shard_size == intra_policy_size and opt_n > 1:
+        return mpu.get_data_parallel_group(
+            partial_data_parallel=True, with_context_parallel=True
+        )
+
+    world_rank = torch.distributed.get_rank()
+    dp_global_ranks = torch.distributed.get_process_group_ranks(
+        mpu.get_data_parallel_group()
+    )
+    instance_id = dp_global_ranks.index(world_rank) // shard_size
+    start = instance_id * shard_size
+    end = start + shard_size
+    return torch.distributed.new_group(ranks=dp_global_ranks[start:end])
+
+
 def build_and_load_ref_model(model_provider) -> List[torch.nn.Module]:
     """Build the reference model and load weights from ``args.ref_load``.
 
@@ -79,12 +298,30 @@ def build_and_load_ref_model(model_provider) -> List[torch.nn.Module]:
         for p in module.parameters():
             p.requires_grad_(False)
 
-    global _REF_MODELS
-    _REF_MODELS = ref_model
     print_rank_0(
         f"[Susono DPO] Reference model ready: "
         f"{sum(p.numel() for m in ref_model for p in m.parameters())} params, frozen."
     )
+
+    shard_group = _get_ref_shard_group(args)
+    cpu_offload = bool(getattr(args, "ref_cpu_offload", False))
+    if cpu_offload or shard_group is not None:
+        ref_model = [
+            LayerWiseShardedRefModel(m, shard_group, cpu_offload=cpu_offload)
+            for m in ref_model
+        ]
+        world = 1 if shard_group is None else torch.distributed.get_world_size(shard_group)
+        storage = "CPU" if cpu_offload else "GPU"
+        print_rank_0(
+            f"[Susono DPO] Ref params layer-wise sharded ({storage}) across {world} "
+            f"ranks (ref-shard-size={args.ref_shard_size}, "
+            f"ref-cpu-offload={cpu_offload})."
+        )
+    else:
+        print_rank_0("[Susono DPO] Ref params not sharded (full GPU replica per rank).")
+
+    global _REF_MODELS
+    _REF_MODELS = ref_model
     return ref_model
 
 
