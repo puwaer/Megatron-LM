@@ -2613,7 +2613,94 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         an intermediary.
         """
         if isinstance(self.optimizer, HybridDeviceOptimizer):
-            self.optimizer.update_fp32_param_by_new_param()
+            # FP8/bf16-aware reload for CPU-offload (HDO) path.
+            #
+            # HDO keeps two distinct "master" mappings, both keyed by the
+            # shard *view* of the model param (the same object that
+            # distrib_optimizer put into the optimizer's param_groups):
+            #
+            #   param_to_fp32_param[shard_view] = fp32/bf16 master tensor
+            #       -- populated only when (a) model_param is FP8, or
+            #          (b) master_dtype != model_param.dtype.
+            #   gpu_params_map_cpu_copy[shard_view] = pinned-CPU clone
+            #       -- populated for every CPU-offloaded param. For bf16
+            #          params with matching master_dtype this is the *only*
+            #          place the master lives. After cpu_optimizer.step(),
+            #          `param_copy_back_gpu_hook` copies this clone back
+            #          into the model param (gpu_param.data.copy_(clone)).
+            #
+            # Both masters are initialised from the model's *pre-load* values
+            # in HDO.__init__. After load_checkpoint with --no-load-optim
+            # they're still at fresh init, so the very first optimizer step
+            # clobbers the freshly-loaded model with that fresh-init master.
+            # We have to refresh both maps from the current (loaded) model
+            # params here.
+            #
+            # FP8 model params: `Float8Tensor.view(-1)[a:b]` returns a plain
+            # uint8 tensor (the Float8Tensor wrapper is dropped), so we have
+            # to dequantize the full model_param first and *then* slice the
+            # shard region, mirroring the existing logic at line 2649 below.
+            hdo = self.optimizer
+            from megatron.training import print_rank_0
+
+            counters = {
+                "total": 0,
+                "fp8_to_fp32": 0,
+                "bf16_to_fp32": 0,
+                "fp8_to_cpu": 0,
+                "bf16_to_cpu": 0,
+                "skipped": 0,
+            }
+
+            def _hdo_copy_group(model_groups, shard_groups):
+                for model_group, shard_group in zip(model_groups, shard_groups):
+                    for model_param, shard_view in zip(model_group, shard_group):
+                        counters["total"] += 1
+                        if shard_view is None:
+                            counters["skipped"] += 1
+                            continue
+
+                        param_range = self._get_model_param_range_map(model_param)["param"]
+                        is_fp8 = is_float8tensor(model_param)
+                        if is_fp8:
+                            src = dequantize_fp8_tensor(model_param).view(-1)[
+                                param_range.start : param_range.end
+                            ]
+                        else:
+                            src = model_param.view(-1)[
+                                param_range.start : param_range.end
+                            ]
+
+                        updated_anywhere = False
+                        fp32_master = hdo.param_to_fp32_param.get(shard_view)
+                        if fp32_master is not None:
+                            fp32_master.data.copy_(src)
+                            updated_anywhere = True
+                            counters["fp8_to_fp32" if is_fp8 else "bf16_to_fp32"] += 1
+
+                        cpu_master = hdo.gpu_params_map_cpu_copy.get(shard_view)
+                        # For FP8+offload, `param_to_fp32_param` and
+                        # `gpu_params_map_cpu_copy` both point at the SAME
+                        # CPU tensor (see hybrid_optimizer.py:464,469,480),
+                        # so skip the second copy in that case.
+                        if cpu_master is not None and cpu_master is not fp32_master:
+                            cpu_master.data.copy_(src)
+                            updated_anywhere = True
+                            counters["fp8_to_cpu" if is_fp8 else "bf16_to_cpu"] += 1
+
+                        if not updated_anywhere:
+                            counters["skipped"] += 1
+
+            _hdo_copy_group(self.model_float16_groups, self.shard_float16_groups)
+            _hdo_copy_group(self.model_fp32_groups, self.shard_fp32_groups)
+            print_rank_0(
+                f"[hdo-reload] total={counters['total']} "
+                f"fp8_to_fp32={counters['fp8_to_fp32']} "
+                f"bf16_to_fp32={counters['bf16_to_fp32']} "
+                f"fp8_to_cpu={counters['fp8_to_cpu']} "
+                f"bf16_to_cpu={counters['bf16_to_cpu']} "
+                f"skipped={counters['skipped']}"
+            )
             return
 
         if self.ddp_config.use_megatron_fsdp:

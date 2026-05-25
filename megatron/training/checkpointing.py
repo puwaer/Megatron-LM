@@ -1774,9 +1774,30 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             module.load_state_dict(state_dict, strict=strict)
         except Exception as e:
             if strict:
+                # Surface the original strict=True failure before falling back.
+                # Without this, dist-ckpt key/shape mismatches that lead to a
+                # fresh-init model on disk are completely silent.
+                import traceback
+                print_rank_0(
+                    f"[load_model_state_dict] strict=True failed: "
+                    f"{type(e).__name__}: {e}\n" + traceback.format_exc()
+                )
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
-                load_return = module.load_state_dict(state_dict, strict=False)
-                print(f"load_return: {load_return}")
+                incompat = module.load_state_dict(state_dict, strict=False)
+                # DDP wrappers return None from load_state_dict; try the inner
+                # module to actually get _IncompatibleKeys for diagnostics.
+                if incompat is None and hasattr(module, "module"):
+                    inner_incompat = module.module.load_state_dict(state_dict, strict=False)
+                    if inner_incompat is not None:
+                        incompat = inner_incompat
+                missing = getattr(incompat, "missing_keys", None)
+                unexpected = getattr(incompat, "unexpected_keys", None)
+                print_rank_0(
+                    f"[load_model_state_dict] strict=False fallback: "
+                    f"missing={missing} unexpected={unexpected}"
+                )
+            else:
+                raise
     # Model.
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:

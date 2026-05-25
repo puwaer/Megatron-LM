@@ -63,9 +63,62 @@ def train_valid_test_datasets_provider(num_samples_train_val_test):
     return train_ds, valid_ds, test_ds
 
 
+def _verify_pretrain_load(model, label):
+    """Print L0 router per-row norm so we can pinpoint when (if at all) the
+    pretrain-loaded weights get clobbered.
+
+    Healthy load → mean ≈ 0.80, std ≈ 0.07 (matches pretrain iter_3238).
+    Fresh init → mean ≈ 0.5774, std ≈ 0.006 (kaiming_uniform_(a=√5)).
+    Also peeks at one FP8 matmul weight (qkv) so we can distinguish a
+    router-only corruption from a global FP8-master failure.
+    """
+    import torch
+    gate = None
+    fp8_probe = None
+    for name, param in model.named_parameters():
+        if gate is None and "decoder.layers.0.mlp.gate.weight" in name:
+            gate = (name, param)
+        if fp8_probe is None and "decoder.layers.0.self_attention.linear_qkv.weight" in name:
+            fp8_probe = (name, param)
+        if gate is not None and fp8_probe is not None:
+            break
+    if gate is not None:
+        name, param = gate
+        with torch.no_grad():
+            row_norm = param.float().norm(dim=1)
+        print_rank_0(
+            f"[load-verify {label}] {name} per-row norm: "
+            f"mean={row_norm.mean().item():.4f} "
+            f"std={row_norm.std().item():.4f} "
+            f"min={row_norm.min().item():.4f} "
+            f"max={row_norm.max().item():.4f}  "
+            f"(fresh init ≈ 0.577 / pretrain ≈ 0.80)"
+        )
+    if fp8_probe is not None:
+        name, param = fp8_probe
+        with torch.no_grad():
+            f = param.float().flatten()
+            mean = f.mean().item()
+            std = f.std().item()
+            absmax = f.abs().max().item()
+        print_rank_0(
+            f"[load-verify {label}] {name} stats: "
+            f"mean={mean:+.4f} std={std:.4f} absmax={absmax:.4f} "
+            f"dtype={param.dtype}"
+        )
+
+
 def forward_step(data_iterator, model):
     args = get_args()
     timers = get_timers()
+
+    seen = getattr(model, "_susono_load_verify_count", 0)
+    # Print router/FP8 stats for the first 6 forward calls so we can see
+    # exactly when (if at all) the model gets corrupted relative to the
+    # optimizer step.
+    if seen < 6:
+        _verify_pretrain_load(model, label=f"fwd{seen}")
+        model._susono_load_verify_count = seen + 1
 
     timers("batch-generator", log_level=2).start()
     tokenizer = get_tokenizer()
