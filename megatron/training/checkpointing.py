@@ -1774,9 +1774,30 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             module.load_state_dict(state_dict, strict=strict)
         except Exception as e:
             if strict:
+                # Surface the original strict=True failure before falling back.
+                # Without this, dist-ckpt key/shape mismatches that lead to a
+                # fresh-init model on disk are completely silent.
+                import traceback
+                print_rank_0(
+                    f"[load_model_state_dict] strict=True failed: "
+                    f"{type(e).__name__}: {e}\n" + traceback.format_exc()
+                )
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
-                load_return = module.load_state_dict(state_dict, strict=False)
-                print(f"load_return: {load_return}")
+                incompat = module.load_state_dict(state_dict, strict=False)
+                # DDP wrappers return None from load_state_dict; try the inner
+                # module to actually get _IncompatibleKeys for diagnostics.
+                if incompat is None and hasattr(module, "module"):
+                    inner_incompat = module.module.load_state_dict(state_dict, strict=False)
+                    if inner_incompat is not None:
+                        incompat = inner_incompat
+                missing = getattr(incompat, "missing_keys", None)
+                unexpected = getattr(incompat, "unexpected_keys", None)
+                print_rank_0(
+                    f"[load_model_state_dict] strict=False fallback: "
+                    f"missing={missing} unexpected={unexpected}"
+                )
+            else:
+                raise
     # Model.
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
@@ -1823,11 +1844,19 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                                                update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
 
             # Load scheduler.
-            if opt_param_scheduler is not None:
+            # Why: even with --override-opt_param-scheduler, load_state_dict still calls
+            #   self.step(increment=num_steps_from_ckpt), which inherits the LR-decay
+            #   position from the previous run. With --reset-iteration the intent is a
+            #   fresh start of training counters, so the scheduler's num_steps must also
+            #   restart at 0; Adam moments are loaded above and are unaffected.
+            if opt_param_scheduler is not None and not getattr(args, 'reset_iteration', False):
                 if 'lr_scheduler' in state_dict: # backward compatbility
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+            elif opt_param_scheduler is not None:
+                print_rank_0(' > reset_iteration=True: skipping opt_param_scheduler '
+                             'state_dict load — LR schedule restarts from num_steps=0')
         except KeyError as e:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '

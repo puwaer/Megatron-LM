@@ -221,6 +221,34 @@ class SusonoBlock(TransformerBlock):
         if engram_config is not None and getattr(config, 'use_engram', False):
             self._attach_engram_modules(config, engram_config)
 
+        # The dist-ckpt sharded_state_dict below renames stream_proj.weight to
+        # stream_proj_pp{N}.weight so each PP stage has a unique key. That key
+        # also surfaces in the plain state_dict that load_checkpoint feeds to
+        # `module.load_state_dict()` for the redundant strict pass — which
+        # then fails strict=True with a missing/unexpected mismatch against
+        # the real parameter name. Register a pre-hook that maps the renamed
+        # key back to `stream_proj.weight` so that pass succeeds cleanly.
+        if self.stream_proj is not None:
+            self._register_load_state_dict_pre_hook(
+                self._rename_stream_proj_pp_key_pre_hook
+            )
+
+    def _rename_stream_proj_pp_key_pre_hook(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        src_key = f'{prefix}stream_proj_pp{pp_rank}.weight'
+        dst_key = f'{prefix}stream_proj.weight'
+        if src_key in state_dict and dst_key not in state_dict:
+            state_dict[dst_key] = state_dict.pop(src_key)
+
     # ------------------------------------------------------------------
     # Engram attachment helpers
     # ------------------------------------------------------------------
