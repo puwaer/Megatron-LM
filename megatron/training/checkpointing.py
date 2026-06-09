@@ -1857,6 +1857,28 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             elif opt_param_scheduler is not None:
                 print_rank_0(' > reset_iteration=True: skipping opt_param_scheduler '
                              'state_dict load — LR schedule restarts from num_steps=0')
+
+            # With --reset-iteration we restart the LR schedule from num_steps=0
+            # (above). But optimizer.load_state_dict()/load_parameter_state() also
+            # restored each param group's per-group 'max_lr'/'min_lr' from the run
+            # that produced this checkpoint (e.g. mid-training's 2e-4).
+            # OptimizerParamScheduler.get_lr() prefers the per-group 'max_lr' over
+            # args.lr (see optimizer_param_scheduler.py get_lr), so without this the
+            # inherited peak LR silently wins and the SFT --lr is ignored. Re-pin the
+            # per-group bounds to the (already --override'd) scheduler values.
+            if (opt_param_scheduler is not None
+                    and getattr(args, 'reset_iteration', False)
+                    and not skip_load_to_model_and_opt
+                    and optimizer is not None
+                    and not optimizer.is_stub_optimizer):
+                for param_group in optimizer.param_groups:
+                    if 'max_lr' in param_group:
+                        param_group['max_lr'] = opt_param_scheduler.max_lr
+                    if 'min_lr' in param_group:
+                        param_group['min_lr'] = opt_param_scheduler.min_lr
+                print_rank_0(' > reset_iteration=True: re-pinned per-group max_lr='
+                             f'{opt_param_scheduler.max_lr} min_lr={opt_param_scheduler.min_lr} '
+                             '(ignoring values inherited from the loaded optimizer)')
         except KeyError as e:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
