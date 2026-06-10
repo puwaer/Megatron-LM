@@ -134,6 +134,16 @@ class SusonoDPOPreferenceDataset(torch.utils.data.Dataset):
         if num_shards > 1:
             self._raw = self._raw.shard(num_shards=num_shards, index=shard_index)
 
+        # Detect offline-pre-tokenized data (produced by
+        # data_format/post_format/pretokenize_post.py): rows carry tokenized
+        # chosen/rejected ids+labels instead of raw prompt/chosen/rejected text.
+        # When present we skip apply_chat_template at training time.
+        cols = getattr(self._raw, "column_names", []) or []
+        self._pretokenized = (
+            "chosen_input_ids" in cols and "chosen_labels" in cols
+            and "rejected_input_ids" in cols and "rejected_labels" in cols
+        )
+
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             world = torch.distributed.get_world_size()
             rank = torch.distributed.get_rank()
@@ -155,13 +165,20 @@ class SusonoDPOPreferenceDataset(torch.utils.data.Dataset):
         max_attempts = max(len(self._raw), 1)
         while attempts < max_attempts:
             raw_idx = (idx + attempts) % len(self._raw)
-            pair = _extract_pair(self._raw[raw_idx])
-            if pair is None:
-                attempts += 1
-                continue
-            chosen_msgs, rejected_msgs = pair
-            c_ids, c_labels = _encode_with_mask(chosen_msgs, self.tokenizer)
-            r_ids, r_labels = _encode_with_mask(rejected_msgs, self.tokenizer)
+            row = self._raw[raw_idx]
+            if self._pretokenized:
+                c_ids = list(row["chosen_input_ids"])
+                c_labels = list(row["chosen_labels"])
+                r_ids = list(row["rejected_input_ids"])
+                r_labels = list(row["rejected_labels"])
+            else:
+                pair = _extract_pair(row)
+                if pair is None:
+                    attempts += 1
+                    continue
+                chosen_msgs, rejected_msgs = pair
+                c_ids, c_labels = _encode_with_mask(chosen_msgs, self.tokenizer)
+                r_ids, r_labels = _encode_with_mask(rejected_msgs, self.tokenizer)
             if not c_ids or not r_ids:
                 attempts += 1
                 continue

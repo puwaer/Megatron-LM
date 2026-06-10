@@ -51,6 +51,55 @@ def _sharegpt_to_openai(example: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return {"messages": out}
 
 
+def encode_chat_with_assistant_mask(messages, tokenizer):
+    """Tokenize a conversation and label assistant spans only.
+
+    Module-level so it can be imported and reused by the offline
+    pre-tokenization tool (``data_format/post_format/pretokenize_post.py``),
+    guaranteeing identical tokenization between offline preprocessing and the
+    runtime fallback path.
+
+    Strategy: encode the full conversation once, then for each assistant turn
+    re-encode the prefix up to (and including) the turn to determine the
+    answer-token span. This is template-agnostic; it does not rely on
+    ``return_assistant_tokens_mask`` support in the chat template.
+
+    Returns ``(input_ids, labels)`` where ``labels`` carries ``-100`` at every
+    non-assistant position (and the assistant token id otherwise).
+    """
+    full_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+    )
+    labels = [-100] * len(full_ids)
+
+    prev_len = 0
+    for turn_idx in range(len(messages)):
+        prefix = messages[: turn_idx + 1]
+        prefix_ids = tokenizer.apply_chat_template(
+            prefix,
+            tokenize=True,
+            add_generation_prompt=False,
+        )
+        cur_len = len(prefix_ids)
+        if cur_len <= prev_len:
+            # No new tokens (shouldn't happen for well-formed templates).
+            prev_len = cur_len
+            continue
+        if messages[turn_idx]["role"] == "assistant":
+            # Mark the assistant span as supervised; keep template wrappers
+            # (system / role tags) outside the span as -100.
+            for j in range(prev_len, cur_len):
+                labels[j] = full_ids[j]
+        prev_len = cur_len
+
+    # Sanity: ensure ids align (the template should be deterministic).
+    if len(full_ids) != len(labels):
+        return [], []
+    return full_ids, labels
+
+
 def _to_messages(example: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
     """Best-effort normalisation of common SFT schemas to OpenAI chat messages."""
     if "messages" in example and isinstance(example["messages"], list):
@@ -113,6 +162,13 @@ class SusonoSFTDataset(torch.utils.data.Dataset):
             self._raw_samples = self._raw_samples.shard(
                 num_shards=num_shards, index=shard_index
             )
+        # Detect offline-pre-tokenized data (produced by
+        # data_format/post_format/pretokenize_post.py): rows carry per-sample
+        # ``input_ids``/``labels`` instead of raw ``messages``. When present we
+        # skip the (CPU-heavy) apply_chat_template step at training time.
+        cols = getattr(self._raw_samples, "column_names", []) or []
+        self._pretokenized = "input_ids" in cols and "labels" in cols
+
         self._raw_index = 0
         self._packed: List[Dict[str, List[int]]] = []
 
@@ -175,15 +231,21 @@ class SusonoSFTDataset(torch.utils.data.Dataset):
         }
 
     def _process_one(self, example: Dict[str, Any]) -> Optional[Dict[str, List[int]]]:
-        messages = _to_messages(example)
-        if messages is None or len(messages) < 2:
-            return None
-        if messages[0]["role"] == "assistant":
-            return None
+        if self._pretokenized:
+            ids = list(example["input_ids"])
+            labels = list(example["labels"])
+            if not ids:
+                return None
+        else:
+            messages = _to_messages(example)
+            if messages is None or len(messages) < 2:
+                return None
+            if messages[0]["role"] == "assistant":
+                return None
 
-        ids, labels = self._encode_messages(messages)
-        if not ids:
-            return None
+            ids, labels = self._encode_messages(messages)
+            if not ids:
+                return None
 
         # Inter-sample separator: an extra eos with -100 label so the loss skips it.
         ids = ids + [self._eos_id]
@@ -194,44 +256,8 @@ class SusonoSFTDataset(torch.utils.data.Dataset):
         return {"input_ids": ids, "labels": labels}
 
     def _encode_messages(self, messages: List[Dict[str, str]]):
-        """Tokenize a conversation and label assistant spans only.
-
-        Strategy: encode the full conversation once, then for each assistant
-        turn re-encode the prefix up to (and including) the turn to determine
-        the answer-token span. This is template-agnostic; it does not rely on
-        ``return_assistant_tokens_mask`` support in the chat template.
-        """
-        full_ids = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=False,
-        )
-        labels = [-100] * len(full_ids)
-
-        prev_len = 0
-        for turn_idx in range(len(messages)):
-            prefix = messages[: turn_idx + 1]
-            prefix_ids = self.tokenizer.apply_chat_template(
-                prefix,
-                tokenize=True,
-                add_generation_prompt=False,
-            )
-            cur_len = len(prefix_ids)
-            if cur_len <= prev_len:
-                # No new tokens (shouldn't happen for well-formed templates).
-                prev_len = cur_len
-                continue
-            if messages[turn_idx]["role"] == "assistant":
-                # Mark the assistant span as supervised; keep template wrappers
-                # (system / role tags) outside the span as -100.
-                for j in range(prev_len, cur_len):
-                    labels[j] = full_ids[j]
-            prev_len = cur_len
-
-        # Sanity: ensure ids align (the template should be deterministic).
-        if len(full_ids) != len(labels):
-            return [], []
-        return full_ids, labels
+        """Thin wrapper around :func:`encode_chat_with_assistant_mask`."""
+        return encode_chat_with_assistant_mask(messages, self.tokenizer)
 
 
 def build_sft_train_valid_test(num_samples_train_val_test, *, args, tokenizer,
