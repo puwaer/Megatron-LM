@@ -16,15 +16,26 @@ from megatron.training.utils import average_losses_across_data_parallel_group
 
 
 def sft_loss_func(labels: torch.Tensor, output_tensor: torch.Tensor):
-    """Standard cross-entropy SFT loss with HF ``-100`` ignore convention."""
+    """Standard cross-entropy SFT loss with HF ``-100`` ignore convention.
+
+    Returns the Megatron 2-tuple ``(loss, {metrics})`` — the same protocol used
+    by ``pretrain_susono.loss_func`` and :func:`dpo_loss_func`. ``loss`` is the
+    per-token mean over answer tokens; the pipeline schedule then divides only by
+    ``num_microbatches`` (see ``schedules.py:267-272``).
+
+    NOTE: do NOT return the 3-tuple ``(loss, num_tokens, metrics)`` here. With
+    ``calculate_per_token_loss=False`` the 3-tuple branch expects ``loss`` to be
+    the per-token *sum* and divides it by ``num_tokens`` itself; returning an
+    already-averaged loss in that branch divides the gradient a second time by
+    ~num_tokens, collapsing it to ~1/num_tokens and breaking SFT optimization.
+    """
     losses = output_tensor.float()
     loss_mask = (labels != -100).float()
     denom = loss_mask.sum().clamp(min=1.0)
     loss = (losses * loss_mask).sum() / denom
 
     averaged_loss = average_losses_across_data_parallel_group([loss])
-    num_tokens = loss_mask.sum().detach().to(torch.int)
-    return loss, num_tokens, {"lm loss": averaged_loss[0]}
+    return loss, {"lm loss": averaged_loss[0]}
 
 
 def get_sequence_logps(output_tensor: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
