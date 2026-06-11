@@ -61,29 +61,27 @@ def _extract_pair(example: Dict[str, Any]) -> Optional[Tuple[List[Dict[str, str]
 def _encode_with_mask(messages: List[Dict[str, str]],
                       tokenizer: transformers.PreTrainedTokenizerBase
                       ) -> Tuple[List[int], List[int]]:
-    """Tokenize a dialogue and mark assistant spans for loss supervision."""
-    full_ids = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=False
+    """Tokenize a dialogue and mark assistant spans for loss supervision.
+
+    Single ``apply_chat_template`` pass with ``return_assistant_tokens_mask``:
+    the chat template wraps each assistant turn in ``{% generation %}`` markers,
+    so HF returns a per-token mask aligned to the actual rendered sequence. This
+    replaces the prefix-re-encoding strategy, which mis-aligns labels for
+    position-dependent templates (e.g. Qwen3-Thinking strips ``<think>`` from
+    non-final assistant turns). See ``sft_dataset.encode_chat_with_assistant_mask``.
+    """
+    enc = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_assistant_tokens_mask=True,
+        return_dict=True,
     )
-    labels = [-100] * len(full_ids)
-
-    prev_len = 0
-    for turn_idx in range(len(messages)):
-        prefix = messages[: turn_idx + 1]
-        prefix_ids = tokenizer.apply_chat_template(
-            prefix, tokenize=True, add_generation_prompt=False
-        )
-        cur_len = len(prefix_ids)
-        if cur_len <= prev_len:
-            prev_len = cur_len
-            continue
-        if messages[turn_idx]["role"] == "assistant":
-            for j in range(prev_len, cur_len):
-                labels[j] = full_ids[j]
-        prev_len = cur_len
-
-    if len(full_ids) != len(labels):
+    full_ids = enc["input_ids"]
+    masks = enc["assistant_masks"]
+    if len(full_ids) != len(masks) or sum(masks) == 0:
         return [], []
+    labels = [tok if m else -100 for tok, m in zip(full_ids, masks)]
     return full_ids, labels
 
 
