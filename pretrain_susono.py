@@ -202,8 +202,22 @@ def _susono_read_rss_gb():
     except Exception:
         pass
     cgroup_gb = -1.0
-    for path in ('/sys/fs/cgroup/memory.current',
-                 '/sys/fs/cgroup/memory/memory.usage_in_bytes'):
+    candidates = ['/sys/fs/cgroup/memory.current',
+                  '/sys/fs/cgroup/memory/memory.usage_in_bytes']
+    # Resolve the nested cgroup path from /proc/self/cgroup so we read THIS
+    # process's memory accounting (the fixed top-level paths often miss it on
+    # PBS/cgroup-v2 nodes, which is why cgroup logged as -1 before).
+    try:
+        with open('/proc/self/cgroup') as f:
+            for line in f:
+                parts = line.strip().split(':', 2)
+                rel = parts[2] if len(parts) == 3 else ''
+                if rel and rel != '/':
+                    candidates.append('/sys/fs/cgroup' + rel + '/memory.current')
+                    candidates.append('/sys/fs/cgroup/memory' + rel + '/memory.usage_in_bytes')
+    except Exception:
+        pass
+    for path in candidates:
         try:
             with open(path) as f:
                 cgroup_gb = int(f.read().strip()) / (1024 ** 3)
@@ -237,6 +251,44 @@ def _susono_cleanup_cpu_caches():
             pass
 
 
+def _susono_save_dir():
+    # Checkpoint save root (args.save); None if args unavailable.
+    try:
+        from megatron.training import get_args
+        return get_args().save
+    except Exception:
+        return None
+
+
+def _susono_drop_page_cache(path):
+    # Flush dirty pages and evict the checkpoint files' page cache from this
+    # node's cgroup. Without this, each torch_dist save leaves ~GBs of file
+    # cache charged to the per-node cgroup (mem=100gb); it accumulates across
+    # saves on top of the ~63GB anon RSS and the 2nd save's write burst trips
+    # the cgroup OOM-killer (SIGKILL -9) even though anon RSS is flat. MALLOC
+    # tuning only controls anon RSS, not page cache — this is the other axis.
+    try:
+        _susono_os.sync()
+    except Exception:
+        pass
+    if not path or not _susono_os.path.isdir(path):
+        return
+    fadv = getattr(_susono_os, 'POSIX_FADV_DONTNEED', None)
+    if fadv is None:
+        return
+    for root, _dirs, files in _susono_os.walk(path):
+        for name in files:
+            fp = _susono_os.path.join(root, name)
+            try:
+                fd = _susono_os.open(fp, _susono_os.O_RDONLY)
+                try:
+                    _susono_os.posix_fadvise(fd, 0, 0, fadv)
+                finally:
+                    _susono_os.close(fd)
+            except Exception:
+                pass
+
+
 import megatron.training.checkpointing as _susono_ckpt_mod
 import megatron.training.training as _susono_train_mod
 _susono_orig_save_checkpoint = _susono_ckpt_mod.save_checkpoint
@@ -251,7 +303,8 @@ def _susono_wrapped_save_checkpoint(iteration, *args, **kwargs):
     finally:
         _susono_log_mem(f"AFTER save iter {iteration}")
         _susono_cleanup_cpu_caches()
-        _susono_log_mem(f"AFTER save iter {iteration} (after gc+malloc_trim)")
+        _susono_drop_page_cache(_susono_save_dir())
+        _susono_log_mem(f"AFTER save iter {iteration} (after gc+malloc_trim+fadvise)")
 
 
 _susono_ckpt_mod.save_checkpoint = _susono_wrapped_save_checkpoint
