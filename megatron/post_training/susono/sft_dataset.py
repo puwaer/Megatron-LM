@@ -60,44 +60,38 @@ def encode_chat_with_assistant_mask(messages, tokenizer):
     guaranteeing identical tokenization between offline preprocessing and the
     runtime fallback path.
 
-    Strategy: encode the full conversation once, then for each assistant turn
-    re-encode the prefix up to (and including) the turn to determine the
-    answer-token span. This is template-agnostic; it does not rely on
-    ``return_assistant_tokens_mask`` support in the chat template.
+    Strategy: a single ``apply_chat_template`` pass with
+    ``return_assistant_tokens_mask=True``. The chat template wraps each
+    assistant turn in ``{% generation %}`` markers, so HF returns a per-token
+    ``assistant_masks`` aligned to the *actual* rendered sequence.
+
+    This replaces the previous prefix-re-encoding strategy, which assumed
+    ``apply_chat_template(messages[:k])`` is always a token-prefix of the full
+    render. That assumption breaks for position-dependent templates such as
+    Qwen3-(Next-)Thinking, which strips ``<think>`` from every non-final
+    assistant turn — so a prefix ending at an earlier assistant turn renders it
+    *with* think while the full conversation renders it *without*, mis-aligning
+    the labels for multi-turn samples. ``assistant_masks`` is computed from the
+    one true render and is therefore always correct.
 
     Returns ``(input_ids, labels)`` where ``labels`` carries ``-100`` at every
     non-assistant position (and the assistant token id otherwise).
     """
-    full_ids = tokenizer.apply_chat_template(
+    enc = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=False,
+        return_assistant_tokens_mask=True,
+        return_dict=True,
     )
-    labels = [-100] * len(full_ids)
-
-    prev_len = 0
-    for turn_idx in range(len(messages)):
-        prefix = messages[: turn_idx + 1]
-        prefix_ids = tokenizer.apply_chat_template(
-            prefix,
-            tokenize=True,
-            add_generation_prompt=False,
-        )
-        cur_len = len(prefix_ids)
-        if cur_len <= prev_len:
-            # No new tokens (shouldn't happen for well-formed templates).
-            prev_len = cur_len
-            continue
-        if messages[turn_idx]["role"] == "assistant":
-            # Mark the assistant span as supervised; keep template wrappers
-            # (system / role tags) outside the span as -100.
-            for j in range(prev_len, cur_len):
-                labels[j] = full_ids[j]
-        prev_len = cur_len
-
-    # Sanity: ensure ids align (the template should be deterministic).
-    if len(full_ids) != len(labels):
+    full_ids = enc["input_ids"]
+    masks = enc["assistant_masks"]
+    # No supervised tokens => template lacks {% generation %} markers or the
+    # conversation has no assistant turn. Skip rather than emit an all-masked
+    # (zero-loss) sample.
+    if len(full_ids) != len(masks) or sum(masks) == 0:
         return [], []
+    labels = [tok if m else -100 for tok, m in zip(full_ids, masks)]
     return full_ids, labels
 
 
