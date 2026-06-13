@@ -27,6 +27,7 @@ import pretrain_susono  # noqa: F401
 
 from megatron.post_training.susono.arguments import add_susono_dpo_args
 from megatron.post_training.susono.batch import get_dpo_batch
+from megatron.post_training.susono.epoch_iters import resolve_iter_defaults
 from megatron.post_training.susono.loss import bind_dpo_loss
 from megatron.post_training.susono.dpo_dataset import build_dpo_train_valid_test
 from megatron.post_training.susono.ref_model import (
@@ -129,11 +130,16 @@ def forward_step(data_iterator, model):
 
 
 if __name__ == "__main__":
+    # Derive train_iters (and the WSD decay tail) from the real number of
+    # preference pairs so a run is exactly --finetune-num-epochs passes over all
+    # data, unless the user pins --train-iters explicitly (CLI wins in validate_args).
+    args_defaults = {"tokenizer_type": "HuggingFaceTokenizer"}
+    args_defaults.update(resolve_iter_defaults("dpo"))
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
+        args_defaults=args_defaults,
         extra_args_provider=add_susono_dpo_args,
     )

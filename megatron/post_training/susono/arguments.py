@@ -21,6 +21,23 @@ def add_susono_sft_args(parser):
         action="store_true",
         help="If set, shard the HF dataset by (expert_)data_parallel_world_size.",
     )
+    group.add_argument(
+        "--finetune-num-epochs",
+        type=int,
+        default=1,
+        help="Number of full passes over --finetune-hf-dataset. When --train-iters "
+             "is not given, train_iters is derived from the real dataset size so "
+             "every sample is seen ~num_epochs times "
+             "(see megatron.post_training.susono.epoch_iters).",
+    )
+    group.add_argument(
+        "--lr-wsd-decay-fraction",
+        type=float,
+        default=0.0,
+        help="WSD annealing length as a fraction of the (auto-derived) train_iters. "
+             "Resolved to an absolute --lr-wsd-decay-iters at startup when that flag "
+             "is not given explicitly. 0 = no WSD decay tail.",
+    )
     return parser
 
 
