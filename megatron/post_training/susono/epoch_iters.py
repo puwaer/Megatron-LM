@@ -109,7 +109,11 @@ def resolve_iter_defaults(kind: str) -> dict:
     import os
     import sys
 
-    p = argparse.ArgumentParser(add_help=False)
+    # allow_abbrev=False: otherwise argparse treats the full command line's
+    # "--lr 2.0e-5" as an ambiguous prefix of --lr-wsd-decay-fraction /
+    # --lr-wsd-decay-iters and aborts. We only want exact matches; everything
+    # else (the bulk of Megatron's flags) falls into parse_known_args' leftovers.
+    p = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     p.add_argument("--finetune-hf-dataset", type=str, default=None)
     p.add_argument("--finetune-data-split", type=str, default="train")
     p.add_argument("--global-batch-size", type=int, default=None)
